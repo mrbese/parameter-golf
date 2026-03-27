@@ -302,6 +302,7 @@ def main():
     parser.add_argument("--mlp-mult", type=int, default=3, help="MLP multiplier for BESE")
     parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--skip-decode", action="store_true", help="Skip decode if shards exist")
+    parser.add_argument("--sota", action="store_true", help="Use SOTA train_gpt (PR #549 stack) instead of baseline BESE integration")
     args = parser.parse_args()
 
     t_start = time.time()
@@ -361,12 +362,18 @@ def main():
         tok = FastBESEBPETokenizer.load(str(tok_path))
 
         # BESE: configurable architecture
+        if args.sota:
+            bese_train_script = BESE_DIR / "integration" / "train_gpt_bese_sota.py"
+            run_name = "bese_sota"
+        else:
+            bese_train_script = BESE_DIR / "integration" / "train_gpt_bese.py"
+            run_name = "bese_v2"
         bese_out = run_training(
-            name="bese_v2",
+            name=run_name,
             data_path=BESE_SHARD_DIR,
             tokenizer_path=tok_path,
             vocab_size=tok.vocab_size,
-            train_script=BESE_DIR / "integration" / "train_gpt_bese.py",
+            train_script=bese_train_script,
             num_layers=args.num_layers,
             model_dim=args.model_dim,
             mlp_mult=args.mlp_mult,
