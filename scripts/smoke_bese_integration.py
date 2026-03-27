@@ -2,6 +2,9 @@
 """
 Smoke test (no GPU required): tokenizer JSON round-trip, byte identity, shard header I/O.
 
+Tests BOTH the old BESEBPETokenizer and the fast FastBESEBPETokenizer to ensure
+the production codepath (fast) is exercised.
+
 Run from repo root:
   .venv/bin/python scripts/smoke_bese_integration.py
 """
@@ -19,6 +22,7 @@ TOK_DIR = ROOT / "tokenizer"
 sys.path.insert(0, str(TOK_DIR))
 
 from bese_bpe_tokenizer import BESEBPETokenizer, train_bpe_merges  # noqa: E402
+from bese_fast_bpe import FastBESEBPETokenizer, train_bpe_merges_fast  # noqa: E402
 
 
 def test_shard_roundtrip(shard_path: Path) -> None:
@@ -39,21 +43,64 @@ def main() -> int:
     with sample.open(encoding="utf-8") as f:
         for line in f:
             texts.append(json.loads(line)["text"])
+
+    # --- Test 1: Old (slow) tokenizer ---
+    print("Testing BESEBPETokenizer (slow)...")
     merges = train_bpe_merges(texts * 50, num_merges=32, verbose=False)
     tok = BESEBPETokenizer(merges=merges)
     bpt = tok.get_bytes_per_token_lut()
     for t in texts:
         enc = tok.encode(t)
-        assert sum(bpt[x] for x in enc) == len(t.encode("utf-8")), "BPB bytes"
+        assert sum(bpt[x] for x in enc) == len(t.encode("utf-8")), "BPB bytes (slow)"
+    print("  BESEBPETokenizer: OK")
 
+    # --- Test 2: Fast tokenizer (production path) ---
+    print("Testing FastBESEBPETokenizer (fast)...")
+    fast_merges = train_bpe_merges_fast(texts * 50, num_merges=32, verbose=False)
+    fast_tok = FastBESEBPETokenizer(merges=fast_merges)
+    fast_bpt = fast_tok.get_bytes_per_token_lut()
+    for t in texts:
+        enc = fast_tok.encode(t)
+        tb = int(sum(fast_bpt[x] for x in enc))
+        ub = len(t.encode("utf-8"))
+        assert tb == ub, f"BPB bytes (fast): token_bytes={tb} utf8={ub}"
+    print("  FastBESEBPETokenizer: OK")
+
+    # --- Test 3: Fast tokenizer edge cases ---
+    print("Testing edge cases...")
+    # Empty text
+    enc_empty = fast_tok.encode("")
+    assert len(enc_empty) == 0, "empty text should produce empty tokens"
+
+    # Single character
+    enc_single = fast_tok.encode("a")
+    assert int(sum(fast_bpt[x] for x in enc_single)) == 1, "single char byte count"
+
+    # Multi-byte UTF-8
+    for ch in ["é", "ñ", "ü", "中"]:
+        enc_mb = fast_tok.encode(ch)
+        assert int(sum(fast_bpt[x] for x in enc_mb)) == len(ch.encode("utf-8")), f"multi-byte {ch}"
+
+    # Round-trip: save/load fast tokenizer
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        json_path = tdir / "fast_tok.json"
+        fast_tok.save(json_path)
+        fast_tok2 = FastBESEBPETokenizer.load(json_path)
+        assert fast_tok2.vocab_size == fast_tok.vocab_size, "vocab_size mismatch after load"
+        for t in texts:
+            enc1 = list(fast_tok.encode(t))
+            enc2 = list(fast_tok2.encode(t))
+            assert enc1 == enc2, f"encode mismatch after save/load for: {t[:40]}"
+    print("  Edge cases: OK")
+
+    # --- Test 4: Shard export with fast tokenizer ---
+    print("Testing shard export...")
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
         json_path = tdir / "tok.json"
-        tok.save(json_path)
-        tok2 = BESEBPETokenizer.load(json_path)
-        assert tok2.vocab_size == tok.vocab_size
+        fast_tok.save(json_path)
 
-        # export_shards dry run via subprocess
         out = tdir / "ds"
         r = subprocess.run(
             [
@@ -84,8 +131,9 @@ def main() -> int:
         train_bins = list(out.glob("fineweb_train_*.bin"))
         assert train_bins, "train shards"
         test_shard_roundtrip(train_bins[0])
+    print("  Shard export: OK")
 
-    print("smoke_bese_integration: OK")
+    print("\nsmoke_bese_integration: ALL PASSED")
     return 0
 
 
