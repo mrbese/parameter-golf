@@ -1868,7 +1868,63 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=6)
+    # --- Selective ±1 pruning to fit TARGET_MB ---
+    target_mb = float(os.environ.get("TARGET_MB", "15.9"))
+    code_bytes_est = len(code.encode("utf-8"))
+    target_bytes = int(target_mb * 1024 * 1024)
+
+    # Build list of ±1 values sorted by reconstruction error (least important first)
+    ones_info = []
+    for name, info in quant_meta.items():
+        if not (isinstance(info, dict) and info.get("type") == "int6"):
+            continue
+        qk, sk = name + ".q", name + ".scale"
+        if qk not in quant_result or sk not in quant_result:
+            continue
+        q, s = quant_result[qk], quant_result[sk]
+        if s.ndim > 0:
+            ones_mask = (q.abs() == 1)
+            if ones_mask.any():
+                row_idx = torch.arange(q.shape[0]).unsqueeze(1).expand_as(q)[ones_mask]
+                flat_idx = torch.arange(q.numel()).reshape(q.shape)[ones_mask]
+                errors = s.float()[row_idx].pow(2)
+                for fi, err in zip(flat_idx.tolist(), errors.tolist()):
+                    ones_info.append((qk, fi, err))
+    ones_info.sort(key=lambda x: x[2])
+
+    def _try_prune(n):
+        tmp = {k: v.clone() for k, v in quant_result.items()}
+        for i in range(min(n, len(ones_info))):
+            tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
+        buf = io.BytesIO()
+        torch.save({"w": tmp, "m": quant_meta}, buf)
+        return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
+
+    no_sz, _ = _try_prune(0)
+    if no_sz <= target_bytes:
+        log0(f"selective_prune: already fits ({no_sz/(1024*1024):.2f}MB <= {target_mb}MB), no pruning needed")
+        quant_blob = lzma.compress(quant_raw, preset=9)
+    else:
+        full_sz, _ = _try_prune(len(ones_info))
+        log0(f"selective_prune: unpruned={no_sz/(1024*1024):.2f}MB full_prune={full_sz/(1024*1024):.2f}MB target={target_mb}MB")
+        if full_sz > target_bytes:
+            log0("selective_prune: even full prune not enough, applying all")
+            _, quant_result = _try_prune(len(ones_info))
+        else:
+            lo, hi = 0, len(ones_info)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                sz, _ = _try_prune(mid)
+                if sz <= target_bytes:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            log0(f"selective_prune: pruning {lo}/{len(ones_info)} values ({100*lo/max(len(ones_info),1):.1f}%) to fit {target_mb}MB")
+            _, quant_result = _try_prune(lo)
+        quant_buf = io.BytesIO()
+        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = lzma.compress(quant_raw, preset=9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
