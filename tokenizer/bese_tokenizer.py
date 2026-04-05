@@ -2,18 +2,20 @@
 BESE Tokenizer: Base-Efficient Subword Encoding
 
 A novel tokenizer for parameter-constrained language models that uses:
-1. Single-token codes for the 8 most frequent English letters (Huffman-inspired)
-2. Two-token codes (group + position) for remaining letters, grouped by
+1. Single-token codes for the 11 most frequent English letters (Huffman-inspired)
+2. Two-token codes (group + position) for remaining 15 letters, grouped by
    context distinguishability (inspired by QWERTY typewriter separation)
 3. Case-insensitive encoding (model learns capitalization from context)
 
 Designed for OpenAI Parameter Golf challenge.
-Total vocabulary: 38 tokens (vs 1024 baseline)
+Total vocabulary: 40 tokens (vs 1024 baseline)
 Embedding savings: ~504,000 parameters
 
 Origin: independently derived from T9 phone input and typewriter jam prevention,
 later recognized as instances of Huffman coding and mutual information minimization.
 """
+
+from __future__ import annotations
 
 import json
 import numpy as np
