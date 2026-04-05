@@ -25,7 +25,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT / "tokenizer") not in sys.path:
     sys.path.insert(0, str(_ROOT / "tokenizer"))
 
-from bese_bpe_tokenizer import BESEBPETokenizer, train_bpe_merges  # noqa: E402
+from bese_fast_bpe import FastBESEBPETokenizer, train_bpe_merges_fast  # noqa: E402
 
 
 def iter_texts(path: Path, max_docs: int | None):
@@ -47,7 +47,7 @@ def main() -> None:
     p.add_argument("--input", type=Path, required=True, help="JSONL with {\"text\": ...} per line")
     p.add_argument("--output", type=Path, help="Output tokenizer JSON (single run)")
     p.add_argument("--output-dir", type=Path, help="Directory for sweep outputs")
-    p.add_argument("--num-merges", type=int, default=250, help="BPE merge count (single run)")
+    p.add_argument("--num-merges", type=int, default=248, help="BPE merge count (single run)")
     p.add_argument("--max-docs", type=int, default=100_000, help="Max training documents")
     p.add_argument(
         "--merge-sweep",
@@ -71,8 +71,8 @@ def main() -> None:
         print(f"Loaded {len(texts):,} documents.")
         for num in counts:
             print(f"\n=== Training {num} merges ===")
-            merges = train_bpe_merges(texts, num_merges=num, verbose=not args.quiet)
-            tok = BESEBPETokenizer(merges=merges)
+            merges = train_bpe_merges_fast(texts, num_merges=num, verbose=not args.quiet)
+            tok = FastBESEBPETokenizer(merges=merges)
             path = out_dir / f"bese_bpe_{num}.json"
             tok.save(path)
             print(f"Saved {path} (vocab_size={tok.vocab_size})")
@@ -85,8 +85,8 @@ def main() -> None:
     print(f"Loading up to {max_docs:,} docs from {args.input} ...")
     texts = list(iter_texts(args.input, max_docs))
     print(f"Loaded {len(texts):,} documents.")
-    merges = train_bpe_merges(texts, num_merges=args.num_merges, verbose=not args.quiet)
-    tok = BESEBPETokenizer(merges=merges)
+    merges = train_bpe_merges_fast(texts, num_merges=args.num_merges, verbose=not args.quiet)
+    tok = FastBESEBPETokenizer(merges=merges)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tok.save(args.output)
     print(f"Saved {args.output} (vocab_size={tok.vocab_size})")
