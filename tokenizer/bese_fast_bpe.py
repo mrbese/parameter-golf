@@ -146,7 +146,8 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
     # Build a count index: we track counts separately for O(1) lookup
     pair_counts = {pair: len(positions) for pair, positions in pair_positions.items()}
 
-    for merge_num in range(num_merges):
+    merge_num = 0
+    while merge_num < num_merges:
         # Find the most frequent pair
         if not pair_counts:
             break
@@ -175,7 +176,7 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
 
         # Re-check count after filtering stale positions
         if len(positions) < 2:
-            continue
+            continue  # don't increment merge_num — this wasn't a real merge
 
         new_id = next_id
         merges.append((best_pair, new_id))
@@ -232,11 +233,12 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
                 pair_counts[new_right_pair] = pair_counts.get(new_right_pair, 0) + 1
 
         next_id += 1
+        merge_num += 1
 
-        if verbose and (merge_num < 20 or merge_num % 50 == 0 or merge_num == num_merges - 1):
+        if verbose and (merge_num <= 20 or merge_num % 50 == 0 or merge_num == num_merges):
             # Count remaining tokens (approximate)
             print(
-                f"  Merge {merge_num + 1:4d}: ({best_pair[0]:3d},{best_pair[1]:3d}) -> {new_id:4d}"
+                f"  Merge {merge_num:4d}: ({best_pair[0]:3d},{best_pair[1]:3d}) -> {new_id:4d}"
                 f"  count={best_count:6d}"
             )
 
