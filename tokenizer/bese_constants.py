@@ -1,7 +1,12 @@
 """
-Shared BESE alphabet constants and lookup tables (38-token base vocabulary).
+Shared BESE alphabet constants and lookup tables (40-token base vocabulary).
 
 Used by bese_tokenizer.py and bese_bpe_tokenizer.py — single source of truth.
+
+v2: Promoted h, d, l to single-token letters (8→11 singles).
+    Regrouped remaining 15 letters into 4 groups (5→4 groups).
+    Reordered positions within groups by frequency (most freq → P1).
+    Saves ~10.5% sequence length for -2 BPE merges.
 """
 
 from __future__ import annotations
@@ -14,32 +19,34 @@ BOS_ID = 1
 EOS_ID = 2
 UNK_ID = 3
 
-# Single-token letters: 8 most frequent in English (e=4 ... r=11)
-SINGLE_LETTERS = "etaoinsr"
+# Single-token letters: 11 most frequent in English (e=4 ... l=14)
+SINGLE_LETTERS = "etaoinsrhdl"
 SINGLE_LETTER_START = 4
 
 # Key groups (group token = 0 bytes; position completes character)
-GROUP_START = 12
+# Ordered by frequency within each group (most frequent → P1).
+# Letters that commonly co-occur in English bigrams are placed in
+# DIFFERENT groups to give BPE cleaner merge patterns.
+GROUP_START = 15
 GROUPS = [
-    "jmfg",  # Group 12
-    "cqky",  # Group 13
-    "zulv",  # Group 14
-    "bxhw",  # Group 15
-    "dp",    # Group 16
+    "cwvj",  # Group 15: c(2.8%) w(2.4%) v(1.0%) j(0.15%)
+    "ufbz",  # Group 16: u(2.8%) f(2.2%) b(1.5%) z(0.07%)
+    "mykx",  # Group 17: m(2.4%) y(2.0%) k(0.8%) x(0.15%)
+    "gpq",   # Group 18: g(2.0%) p(1.9%) q(0.10%)
 ]
 
-POS_START = 17
+POS_START = 19
 
-SPACE_ID = 21
-PERIOD_ID = 22
-COMMA_ID = 23
-NEWLINE_ID = 24
-QUESTION_ID = 25
-QUOTE_ID = 26
-OTHER_PUNCT_ID = 27
-DIGIT_START = 28
+SPACE_ID = 23
+PERIOD_ID = 24
+COMMA_ID = 25
+NEWLINE_ID = 26
+QUESTION_ID = 27
+QUOTE_ID = 28
+OTHER_PUNCT_ID = 29
+DIGIT_START = 30
 
-BASE_VOCAB_SIZE = 38
+BASE_VOCAB_SIZE = 40
 VOCAB_SIZE = BASE_VOCAB_SIZE  # alias for base-only tokenizer
 
 

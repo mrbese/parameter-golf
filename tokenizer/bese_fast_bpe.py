@@ -475,7 +475,7 @@ if __name__ == "__main__":
         "Hello world!",
         "The quick brown fox jumps over the lazy dog.",
         "Parameter Golf is a challenge to train the best language model.",
-        "BESE uses a 38-token structured alphabet with BPE merges on top.",
+        "BESE uses a 40-token structured alphabet with BPE merges on top.",
     ] * 200
 
     print("=== Fast BPE Training ===")

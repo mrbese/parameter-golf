@@ -2,7 +2,7 @@
 BESE+BPE Tokenizer: Base-Efficient Subword Encoding with BPE
 
 Two-layer tokenization:
-  Layer 1 (BESE): Maps characters to a 38-token structured alphabet using
+  Layer 1 (BESE): Maps characters to a 40-token structured alphabet using
     frequency-weighted single-token codes and context-aware grouped codes.
   Layer 2 (BPE): Learns common patterns in the BESE token stream and merges
     them into single tokens, reducing sequence length.

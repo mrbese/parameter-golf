@@ -39,20 +39,20 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 # Paste lines 11-42 and 90-115 from bese_constants.py.
 # ===========================================================================
 PAD_ID, BOS_ID, EOS_ID, UNK_ID = 0, 1, 2, 3
-SINGLE_LETTERS = "etaoinsr"
+SINGLE_LETTERS = "etaoinsrhdl"
 SINGLE_LETTER_START = 4
-GROUP_START = 12
-GROUPS = ["jmfg", "cqky", "zulv", "bxhw", "dp"]
-POS_START = 17
-SPACE_ID = 21
-PERIOD_ID = 22
-COMMA_ID = 23
-NEWLINE_ID = 24
-QUESTION_ID = 25
-QUOTE_ID = 26
-OTHER_PUNCT_ID = 27
-DIGIT_START = 28
-BASE_VOCAB_SIZE = 38
+GROUP_START = 15
+GROUPS = ["cwvj", "ufbz", "mykx", "gpq"]
+POS_START = 19
+SPACE_ID = 23
+PERIOD_ID = 24
+COMMA_ID = 25
+NEWLINE_ID = 26
+QUESTION_ID = 27
+QUOTE_ID = 28
+OTHER_PUNCT_ID = 29
+DIGIT_START = 30
+BASE_VOCAB_SIZE = 40
 
 def _build_bytes_per_token() -> np.ndarray:
     """UTF-8 bytes each base token represents (BPB-critical)."""
