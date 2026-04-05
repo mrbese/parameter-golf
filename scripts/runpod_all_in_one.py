@@ -27,7 +27,7 @@ TOK_DIR = BESE_DIR / "tokenizers"
 BESE_SHARD_DIR = Path("/workspace/bese_shards")
 
 MAX_DOCS = 10_000
-NUM_MERGES = 250
+NUM_MERGES = 248
 
 sys.path.insert(0, str(BESE_DIR / "tokenizer"))
 
@@ -81,11 +81,11 @@ def decode_shards():
 def train_bpe(texts):
     """Train BESE BPE on decoded texts."""
     step(f"STEP 2: Training BESE BPE ({NUM_MERGES} merges on {len(texts)} docs)")
-    from bese_bpe_tokenizer import BESEBPETokenizer, train_bpe_merges
+    from bese_fast_bpe import FastBESEBPETokenizer, train_bpe_merges_fast
 
     t0 = time.time()
-    merges = train_bpe_merges(texts, num_merges=NUM_MERGES, verbose=True)
-    tok = BESEBPETokenizer(merges=merges)
+    merges = train_bpe_merges_fast(texts, num_merges=NUM_MERGES, verbose=True)
+    tok = FastBESEBPETokenizer(merges=merges)
     elapsed = time.time() - t0
     print(f"  BPE training took {elapsed:.1f}s")
     print(f"  Vocab size: {tok.vocab_size}")
@@ -189,9 +189,9 @@ def run_baseline():
 def run_bese(tok_path):
     """Run BESE+BPE training for 10 minutes."""
     step("STEP 4b: Running BESE+BPE training - 10 min")
-    from bese_bpe_tokenizer import BESEBPETokenizer
+    from bese_fast_bpe import FastBESEBPETokenizer
 
-    tok = BESEBPETokenizer.load(str(tok_path))
+    tok = FastBESEBPETokenizer.load(str(tok_path))
 
     env = os.environ.copy()
     env.update(

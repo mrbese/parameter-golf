@@ -296,7 +296,7 @@ def main():
     parser = argparse.ArgumentParser(description="BESE v2: Fair comparison on RunPod")
     parser.add_argument("--bese-only", action="store_true", help="Skip baseline, run BESE only")
     parser.add_argument("--baseline-only", action="store_true", help="Skip BESE, run baseline only")
-    parser.add_argument("--num-merges", type=int, default=250, help="Number of BPE merges")
+    parser.add_argument("--num-merges", type=int, default=248, help="Number of BPE merges")
     parser.add_argument("--max-docs", type=int, default=None, help="Max docs to decode (None=all)")
     parser.add_argument("--num-layers", type=int, default=11, help="Transformer layers for BESE")
     parser.add_argument("--model-dim", type=int, default=512, help="Model dimension for BESE")

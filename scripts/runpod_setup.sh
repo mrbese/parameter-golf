@@ -61,7 +61,7 @@ echo ""
 
 cd /workspace
 python3 bese/scripts/runpod_v2.py \
-    --num-merges 250 \
+    --num-merges 248 \
     --num-layers 11 \
     --model-dim 512 \
     --mlp-mult 3
