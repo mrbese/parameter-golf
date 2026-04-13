@@ -150,13 +150,40 @@ def train_bpe(texts, num_merges=4000):
     return tok, tok_path
 
 
-def export_bese_shards(tok, train_texts, val_texts):
-    """Export BESE+BPE binary shards matching upstream format."""
-    step(f"STEP 3: Exporting BESE shards ({len(train_texts)} train, {len(val_texts)} val docs)")
+def _encode_doc(args):
+    """Encode a single doc — runs in a worker process."""
+    text, tok_path = args
+    import sys
+    sys.path.insert(0, str(BESE_DIR / "tokenizer"))
+    from bese_fast_bpe import FastBESEBPETokenizer
+    tok = FastBESEBPETokenizer.load(tok_path)
+    return tok.encode(text).astype("uint16")
+
+
+def export_bese_shards(tok, train_texts, val_texts, max_train_tokens=500_000_000, num_workers=None):
+    """Export BESE+BPE binary shards matching upstream format.
+
+    max_train_tokens: stop after this many tokens (~500M is plenty for a 10-min run).
+    Encoding parallelized across CPU workers.
+    """
+    import multiprocessing as mp
+    if num_workers is None:
+        num_workers = min(mp.cpu_count(), 64)
+
+    # Cap train docs — 10-min run consumes ~300-400M tokens max
+    # Estimate ~400 tokens/doc on average; cap with 25% headroom
+    est_docs_needed = int(max_train_tokens / 400 * 1.25)
+    if len(train_texts) > est_docs_needed:
+        print(f"  Capping train docs: {len(train_texts):,} -> {est_docs_needed:,} (enough for {max_train_tokens/1e6:.0f}M tokens)")
+        train_texts = train_texts[:est_docs_needed]
+
+    step(f"STEP 3: Exporting BESE shards ({len(train_texts):,} train, {len(val_texts):,} val docs, {num_workers} workers)")
 
     BESE_SHARD_DIR.mkdir(parents=True, exist_ok=True)
     HEADER_INTS = 256
-    SHARD_SIZE = 100_000_000  # ~100M tokens per shard
+    SHARD_SIZE = 100_000_000
+
+    tok_path = str(TOK_DIR / f"bese_bpe_4000.json")
 
     def write_shard(path, tokens):
         header = np.zeros(HEADER_INTS, dtype="<i4")
@@ -168,56 +195,42 @@ def export_bese_shards(tok, train_texts, val_texts):
             f.write(tokens.astype("<u2").tobytes())
         return int(tokens.shape[0])
 
-    # Encode and write validation shard
-    print("  Encoding validation docs...")
-    t0 = time.time()
-    val_chunks = []
-    for i, text in enumerate(val_texts):
-        enc = tok.encode(text)
-        val_chunks.append(enc.astype(np.uint16))
-        if (i + 1) % 1000 == 0:
-            print(f"    {i+1}/{len(val_texts)} val docs encoded...", flush=True)
-    val_tokens = np.concatenate(val_chunks) if val_chunks else np.array([], dtype=np.uint16)
-    val_path = BESE_SHARD_DIR / "fineweb_val_000000.bin"
-    n = write_shard(val_path, val_tokens)
-    print(f"  Val shard: {n:,} tokens ({time.time()-t0:.1f}s)")
-
-    # Encode and write training shards
-    print("  Encoding training docs...")
-    t0 = time.time()
-    train_chunks = []
-    total_train_tokens = 0
-    shard_idx = 0
-
-    for i, text in enumerate(train_texts):
-        enc = tok.encode(text)
-        train_chunks.append(enc.astype(np.uint16))
-        total_train_tokens += len(enc)
-
-        if total_train_tokens >= SHARD_SIZE:
-            shard_tokens = np.concatenate(train_chunks)
-            shard_path = BESE_SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
-            n = write_shard(shard_path, shard_tokens)
-            print(f"  Train shard {shard_idx}: {n:,} tokens")
-            train_chunks = []
-            total_train_tokens = 0
+    def encode_and_write(texts, prefix, is_val=False):
+        args = [(t, tok_path) for t in texts]
+        chunks = []
+        total_tokens = 0
+        shard_idx = 0
+        t0 = time.time()
+        with mp.Pool(num_workers) as pool:
+            for i, enc in enumerate(pool.imap(_encode_doc, args, chunksize=50)):
+                chunks.append(enc)
+                total_tokens += len(enc)
+                if (i + 1) % 10000 == 0:
+                    elapsed = time.time() - t0
+                    rate = (i + 1) / elapsed
+                    print(f"    {i+1}/{len(texts)} docs ({rate:.0f} docs/s, ~{(len(texts)-i-1)/rate:.0f}s remaining)", flush=True)
+                if not is_val and total_tokens >= SHARD_SIZE:
+                    shard_tokens = np.concatenate(chunks)
+                    path = BESE_SHARD_DIR / f"{prefix}_{shard_idx:06d}.bin"
+                    n = write_shard(path, shard_tokens)
+                    print(f"  Shard {shard_idx}: {n:,} tokens", flush=True)
+                    chunks = []
+                    total_tokens = 0
+                    shard_idx += 1
+        if chunks:
+            shard_tokens = np.concatenate(chunks)
+            path = BESE_SHARD_DIR / f"{prefix}_{shard_idx:06d}.bin"
+            n = write_shard(path, shard_tokens)
+            print(f"  {'Val' if is_val else 'Final train'} shard: {n:,} tokens ({time.time()-t0:.1f}s)", flush=True)
             shard_idx += 1
+        return shard_idx
 
-        if (i + 1) % 5000 == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            remaining = (len(train_texts) - i - 1) / rate
-            print(f"    {i+1}/{len(train_texts)} train docs ({rate:.0f} docs/s, ~{remaining:.0f}s remaining)", flush=True)
+    print("  Encoding validation docs...")
+    encode_and_write(val_texts, "fineweb_val", is_val=True)
 
-    if train_chunks:
-        shard_tokens = np.concatenate(train_chunks)
-        shard_path = BESE_SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
-        n = write_shard(shard_path, shard_tokens)
-        print(f"  Train shard {shard_idx}: {n:,} tokens")
-
-    elapsed = time.time() - t0
-    total_shards = shard_idx + (1 if train_chunks else 0)
-    print(f"\n  Export complete: {total_shards} train shards + 1 val shard ({elapsed:.1f}s)")
+    print("  Encoding training docs...")
+    n_shards = encode_and_write(train_texts, "fineweb_train")
+    print(f"\n  Export complete: {n_shards} train shards + 1 val shard")
     print(f"  Shards written to {BESE_SHARD_DIR}")
 
 
