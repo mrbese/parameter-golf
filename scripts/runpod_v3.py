@@ -44,72 +44,66 @@ def step(msg):
     print(f"\n{'='*70}\n  {msg}\n{'='*70}", flush=True)
 
 
-def decode_all_shards(max_docs=None):
-    """Decode text from ALL SP binary shards for full data parity."""
-    step("STEP 1: Decoding documents from SP shards")
+def _decode_shard(args):
+    """Decode a single shard — runs in a worker process."""
+    shard_file, sp_model_path, min_len = args
     import sentencepiece as spm
-
-    sp = spm.SentencePieceProcessor(model_file=str(SP_MODEL))
+    import numpy as np
+    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
     bos = sp.bos_id()
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    header = np.fromfile(shard_file, dtype="<i4", count=256)
+    n = int(header[2])
+    tokens = np.fromfile(shard_file, dtype="<u2", count=n, offset=header_bytes)
+    docs = []
+    current = []
+    for t in tokens:
+        if t == bos:
+            if current:
+                text = sp.decode(current)
+                if len(text.strip()) > min_len:
+                    docs.append(text)
+            current = []
+        else:
+            current.append(int(t))
+    if current:
+        text = sp.decode(current)
+        if len(text.strip()) > min_len:
+            docs.append(text)
+    return str(shard_file.name), n, docs
+
+
+def decode_all_shards(max_docs=None, num_workers=None):
+    """Decode text from ALL SP binary shards in parallel."""
+    import multiprocessing as mp
+    step("STEP 1: Decoding documents from SP shards (parallel)")
 
     shard_files = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
-    print(f"  Found {len(shard_files)} training shards")
-
-    all_docs = []
-    header_bytes = 256 * np.dtype("<i4").itemsize
-
-    for shard_file in shard_files:
-        header = np.fromfile(shard_file, dtype="<i4", count=256)
-        n = int(header[2])
-        tokens = np.fromfile(shard_file, dtype="<u2", count=n, offset=header_bytes)
-        print(f"  {shard_file.name}: {n:,} tokens", end="")
-
-        docs_from_shard = []
-        current = []
-        for t in tokens:
-            if t == bos:
-                if current:
-                    text = sp.decode(current)
-                    if len(text.strip()) > 50:
-                        docs_from_shard.append(text)
-                current = []
-            else:
-                current.append(int(t))
-        if current:
-            text = sp.decode(current)
-            if len(text.strip()) > 50:
-                docs_from_shard.append(text)
-
-        all_docs.extend(docs_from_shard)
-        print(f" -> {len(docs_from_shard):,} docs (total: {len(all_docs):,})")
-
-        if max_docs and len(all_docs) >= max_docs:
-            all_docs = all_docs[:max_docs]
-            print(f"  Reached max_docs={max_docs}, stopping")
-            break
-
-    # Also decode validation shard
     val_files = sorted(SHARD_DIR.glob("fineweb_val_*.bin"))
+    sp_model_path = str(SP_MODEL)
+
+    if num_workers is None:
+        num_workers = min(mp.cpu_count(), len(shard_files))
+    print(f"  Found {len(shard_files)} training shards, using {num_workers} workers")
+
+    train_args = [(f, sp_model_path, 50) for f in shard_files]
+    all_docs = []
+    with mp.Pool(num_workers) as pool:
+        for name, n, docs in pool.imap(_decode_shard, train_args):
+            all_docs.extend(docs)
+            print(f"  {name}: {n:,} tokens -> {len(docs):,} docs (total: {len(all_docs):,})", flush=True)
+            if max_docs and len(all_docs) >= max_docs:
+                pool.terminate()
+                all_docs = all_docs[:max_docs]
+                print(f"  Reached max_docs={max_docs}, stopping")
+                break
+
+    val_args = [(f, sp_model_path, 50) for f in val_files]
     val_docs = []
-    for vf in val_files:
-        header = np.fromfile(vf, dtype="<i4", count=256)
-        n = int(header[2])
-        tokens = np.fromfile(vf, dtype="<u2", count=n, offset=header_bytes)
-        current = []
-        for t in tokens:
-            if t == bos:
-                if current:
-                    text = sp.decode(current)
-                    if len(text.strip()) > 50:
-                        val_docs.append(text)
-                current = []
-            else:
-                current.append(int(t))
-        if current:
-            text = sp.decode(current)
-            if len(text.strip()) > 50:
-                val_docs.append(text)
-        print(f"  {vf.name}: {n:,} tokens -> {len(val_docs):,} val docs")
+    with mp.Pool(min(num_workers, len(val_files))) as pool:
+        for name, n, docs in pool.imap(_decode_shard, val_args):
+            val_docs.extend(docs)
+            print(f"  {name}: {n:,} tokens -> {len(docs):,} val docs", flush=True)
 
     print(f"\n  Total: {len(all_docs):,} train docs, {len(val_docs):,} val docs")
     return all_docs, val_docs
