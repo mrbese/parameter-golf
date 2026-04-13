@@ -359,14 +359,24 @@ def main():
     # Step 1: Decode all shards
     tok_path = None
     if not args.baseline_only:
-        if args.skip_decode and BESE_SHARD_DIR.exists() and list(BESE_SHARD_DIR.glob("*.bin")):
-            print("  Skipping decode, using existing BESE shards")
+        train_shards_exist = BESE_SHARD_DIR.exists() and list(BESE_SHARD_DIR.glob("fineweb_train_*.bin"))
+        tok_candidates = sorted(TOK_DIR.glob(f"bese_bpe_{args.num_merges}.json"))
+
+        if args.skip_decode and train_shards_exist:
+            print(f"  --skip-decode: found existing train shards in {BESE_SHARD_DIR}, skipping decode+BPE+export")
+            tok_path = tok_candidates[-1] if tok_candidates else None
         else:
             train_texts, val_texts = decode_all_shards(max_docs=args.max_docs)
 
-            # Step 2: Train BPE (use subset for BPE training)
-            bpe_train_texts = train_texts[:50000]
-            tok, tok_path = train_bpe(bpe_train_texts, num_merges=args.num_merges)
+            # Step 2: Train BPE (use subset; skip if tokenizer already saved)
+            if tok_candidates:
+                tok_path = tok_candidates[-1]
+                print(f"  Found existing tokenizer {tok_path.name}, skipping BPE training")
+                from bese_fast_bpe import FastBESEBPETokenizer
+                tok = FastBESEBPETokenizer.load(str(tok_path))
+            else:
+                bpe_train_texts = train_texts[:50000]
+                tok, tok_path = train_bpe(bpe_train_texts, num_merges=args.num_merges)
 
             # Step 3: Export shards
             export_bese_shards(tok, train_texts, val_texts)
