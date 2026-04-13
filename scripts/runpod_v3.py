@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-RunPod v2: All-in-one script for fair BESE vs baseline comparison.
+RunPod v3: End-to-end BESE submission pipeline for Parameter Golf.
 
-Key improvements over v1:
-- Decodes ALL 10 SP shards (not just shard 0) for data parity
-- Uses fast BPE training and encoding (indexed, not O(merges*tokens))
-- Configurable model architecture (layers, width, MLP mult)
-- Proper validation with BPB reporting
+Targets 8xH100 pod. Decodes SP shards -> trains BESE BPE -> exports BESE shards
+-> trains with winning architecture (param banks, Muon, INT6, TTT) -> evaluates.
 
 Usage (on the RunPod pod):
-  # Setup (template provides /workspace/parameter-golf with data):
-  cd /workspace && git clone -b experiment-results https://github.com/mrbese/parameter-golf.git bese
+  cd /workspace && git clone https://github.com/mrbese/parameter-golf-bese.git bese
+  cd /workspace && python3 bese/scripts/runpod_v3.py
 
-  # Run fair comparison:
-  cd /workspace && python3 bese_code/scripts/runpod_v2.py
+  # BESE only (skip baseline):
+  python3 bese/scripts/runpod_v3.py --bese-only
 
-  # Run BESE only with custom config:
-  python3 bese_code/scripts/runpod_v2.py --bese-only --num-layers 11 --model-dim 576 --mlp-mult 3
+  # Custom config:
+  python3 bese/scripts/runpod_v3.py --num-merges 4000 --num-layers 12 --ttt
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,7 +35,7 @@ BESE_DIR = Path(os.environ.get("BESE_DIR", "/workspace/bese"))
 SP_MODEL = PG_DIR / "data/tokenizers/fineweb_1024_bpe.model"
 SHARD_DIR = PG_DIR / "data/datasets/fineweb10B_sp1024"
 TOK_DIR = BESE_DIR / "tokenizers"
-BESE_SHARD_DIR = Path("/workspace/bese_shards_v2")
+BESE_SHARD_DIR = Path("/workspace/bese_shards_v3")
 
 sys.path.insert(0, str(BESE_DIR / "tokenizer"))
 
@@ -48,7 +46,7 @@ def step(msg):
 
 def decode_all_shards(max_docs=None):
     """Decode text from ALL SP binary shards for full data parity."""
-    step("STEP 1: Decoding documents from ALL SP shards")
+    step("STEP 1: Decoding documents from SP shards")
     import sentencepiece as spm
 
     sp = spm.SentencePieceProcessor(model_file=str(SP_MODEL))
@@ -117,7 +115,7 @@ def decode_all_shards(max_docs=None):
     return all_docs, val_docs
 
 
-def train_bpe(texts, num_merges=250):
+def train_bpe(texts, num_merges=4000):
     """Train BESE BPE using fast indexed approach."""
     step(f"STEP 2: Training BESE BPE ({num_merges} merges on {len(texts)} docs)")
     from bese_fast_bpe import train_bpe_merges_fast, FastBESEBPETokenizer
@@ -144,6 +142,11 @@ def train_bpe(texts, num_merges=250):
     if fail > 0:
         print("  WARNING: Byte check failures detected!")
 
+    # Compression ratio
+    total_tokens = sum(len(tok.encode(t)) for t in texts[:1000])
+    total_bytes = sum(len(t.encode("utf-8")) for t in texts[:1000])
+    print(f"  Compression: {total_tokens/total_bytes:.3f} tokens/byte (on 1K docs)")
+
     # Save tokenizer
     TOK_DIR.mkdir(parents=True, exist_ok=True)
     tok_path = TOK_DIR / f"bese_bpe_{num_merges}.json"
@@ -159,7 +162,7 @@ def export_bese_shards(tok, train_texts, val_texts):
 
     BESE_SHARD_DIR.mkdir(parents=True, exist_ok=True)
     HEADER_INTS = 256
-    SHARD_SIZE = 100_000_000  # ~100M tokens per shard (upstream uses ~100M)
+    SHARD_SIZE = 100_000_000  # ~100M tokens per shard
 
     def write_shard(path, tokens):
         header = np.zeros(HEADER_INTS, dtype="<i4")
@@ -197,7 +200,6 @@ def export_bese_shards(tok, train_texts, val_texts):
         train_chunks.append(enc.astype(np.uint16))
         total_train_tokens += len(enc)
 
-        # Write shard when we hit the target size
         if total_train_tokens >= SHARD_SIZE:
             shard_tokens = np.concatenate(train_chunks)
             shard_path = BESE_SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
@@ -213,7 +215,6 @@ def export_bese_shards(tok, train_texts, val_texts):
             remaining = (len(train_texts) - i - 1) / rate
             print(f"    {i+1}/{len(train_texts)} train docs ({rate:.0f} docs/s, ~{remaining:.0f}s remaining)", flush=True)
 
-    # Write remaining tokens
     if train_chunks:
         shard_tokens = np.concatenate(train_chunks)
         shard_path = BESE_SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
@@ -227,10 +228,10 @@ def export_bese_shards(tok, train_texts, val_texts):
 
 
 def run_training(name, data_path, tokenizer_path, vocab_size, train_script,
-                 num_layers=9, model_dim=512, mlp_mult=2, num_gpus=1,
+                 num_layers=11, model_dim=512, mlp_mult=3, num_gpus=8,
                  extra_env=None):
     """Run a training job and return the output."""
-    step(f"TRAINING: {name} ({num_layers}L/{model_dim}d/{mlp_mult}x MLP)")
+    step(f"TRAINING: {name} ({num_layers}L/{model_dim}d/{mlp_mult}x MLP, {num_gpus} GPUs)")
 
     env = os.environ.copy()
     env.update({
@@ -253,7 +254,8 @@ def run_training(name, data_path, tokenizer_path, vocab_size, train_script,
         str(train_script),
     ]
     print(f"  Command: {' '.join(cmd)}")
-    print(f"  Env: VOCAB_SIZE={vocab_size} NUM_LAYERS={num_layers} MODEL_DIM={model_dim} MLP_MULT={mlp_mult}")
+    print(f"  Key env: VOCAB_SIZE={vocab_size} NUM_LAYERS={num_layers} "
+          f"MODEL_DIM={model_dim} MLP_MULT={mlp_mult}")
 
     t0 = time.time()
     output_lines = []
@@ -274,34 +276,64 @@ def run_training(name, data_path, tokenizer_path, vocab_size, train_script,
 
 
 def extract_metrics(output):
-    """Extract val_loss and val_bpb from training output."""
-    val_loss = val_bpb = None
-    model_size = None
+    """Extract metrics from training output. Prefers sliding window / TTT BPB."""
+    metrics = {}
     for line in output.strip().split("\n"):
-        if "val_bpb:" in line:
+        # Sliding window (most accurate non-TTT score)
+        if "final_int8_zlib_roundtrip_exact" in line and "val_bpb:" in line:
             for part in line.split():
                 if part.startswith("val_bpb:"):
-                    val_bpb = float(part.split(":")[1])
+                    metrics["sliding_bpb"] = float(part.split(":")[1])
                 if part.startswith("val_loss:"):
-                    val_loss = float(part.split(":")[1])
-        if ("Serialized model int8+zlib" in line or "Total submission size" in line) and "bytes" in line:
-            import re
+                    metrics["sliding_loss"] = float(part.split(":")[1])
+        # INT6 roundtrip (quantized model quality)
+        if "final_int6_roundtrip_exact" in line:
+            for part in line.split():
+                if part.startswith("val_bpb:"):
+                    metrics["int6_bpb"] = float(part.split(":")[1])
+        # TTT (best possible score)
+        if "legal_ttt_exact" in line:
+            for part in line.split():
+                if part.startswith("val_bpb:"):
+                    metrics["ttt_bpb"] = float(part.split(":")[1])
+        # SLOT
+        if "slot_lbfgs_exact" in line:
+            for part in line.split():
+                if part.startswith("val_bpb:"):
+                    metrics["slot_bpb"] = float(part.split(":")[1])
+        # Submission size
+        if "Total submission size" in line and "bytes" in line:
             m = re.search(r'(\d+)\s*bytes', line)
             if m:
-                model_size = int(m.group(1))
-    return val_loss, val_bpb, model_size
+                metrics["size_bytes"] = int(m.group(1))
+        # Serialized model size
+        if "Serialized model int6+lzma:" in line:
+            m = re.search(r'(\d+)\s*bytes', line)
+            if m:
+                metrics["model_bytes"] = int(m.group(1))
+
+    # Best BPB: TTT > SLOT > sliding > int6
+    metrics["best_bpb"] = (
+        metrics.get("ttt_bpb")
+        or metrics.get("slot_bpb")
+        or metrics.get("sliding_bpb")
+        or metrics.get("int6_bpb")
+    )
+    return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BESE v2: Fair comparison on RunPod")
+    parser = argparse.ArgumentParser(description="BESE v3: End-to-end Parameter Golf submission")
     parser.add_argument("--bese-only", action="store_true", help="Skip baseline, run BESE only")
     parser.add_argument("--baseline-only", action="store_true", help="Skip BESE, run baseline only")
     parser.add_argument("--num-merges", type=int, default=4000, help="Number of BPE merges")
     parser.add_argument("--max-docs", type=int, default=None, help="Max docs to decode (None=all)")
-    parser.add_argument("--num-layers", type=int, default=11, help="Transformer layers for BESE")
-    parser.add_argument("--model-dim", type=int, default=512, help="Model dimension for BESE")
-    parser.add_argument("--mlp-mult", type=int, default=3, help="MLP multiplier for BESE")
-    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs")
+    parser.add_argument("--num-layers", type=int, default=11, help="Transformer layers")
+    parser.add_argument("--model-dim", type=int, default=512, help="Model dimension")
+    parser.add_argument("--mlp-mult", type=int, default=3, help="MLP multiplier")
+    parser.add_argument("--num-gpus", type=int, default=8, help="Number of GPUs")
+    parser.add_argument("--ttt", action="store_true", help="Enable TTT eval")
+    parser.add_argument("--slot", action="store_true", help="Enable SLOT eval")
     parser.add_argument("--skip-decode", action="store_true", help="Skip decode if shards exist")
     args = parser.parse_args()
 
@@ -311,46 +343,47 @@ def main():
     try:
         result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
         detected_gpus = len([l for l in result.stdout.strip().split("\n") if "GPU" in l])
-        if args.num_gpus == 1 and detected_gpus > 1:
+        if detected_gpus > 0 and args.num_gpus != detected_gpus:
             print(f"  Detected {detected_gpus} GPUs, using all of them")
             args.num_gpus = detected_gpus
     except Exception:
         pass
 
     # Step 1: Decode all shards
+    tok_path = None
     if not args.baseline_only:
         if args.skip_decode and BESE_SHARD_DIR.exists() and list(BESE_SHARD_DIR.glob("*.bin")):
             print("  Skipping decode, using existing BESE shards")
-            train_texts = val_texts = None
         else:
             train_texts, val_texts = decode_all_shards(max_docs=args.max_docs)
 
-            # Step 2: Train BPE
-            # Use a subset for BPE training (first 50K docs is usually enough)
+            # Step 2: Train BPE (use subset for BPE training)
             bpe_train_texts = train_texts[:50000]
             tok, tok_path = train_bpe(bpe_train_texts, num_merges=args.num_merges)
 
             # Step 3: Export shards
             export_bese_shards(tok, train_texts, val_texts)
             del train_texts, val_texts  # free memory
-    else:
-        tok_path = None
 
     # Step 4: Run training
     results = {}
 
     if not args.bese_only:
-        # Baseline: SP1024, 9L/512d/2x MLP (standard config)
+        # Baseline: upstream SP1024 with winning architecture
         baseline_out = run_training(
             name="baseline_sp1024",
             data_path=SHARD_DIR,
             tokenizer_path=SP_MODEL,
             vocab_size=1024,
             train_script=PG_DIR / "train_gpt.py",
-            num_layers=9,
-            model_dim=512,
-            mlp_mult=2,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            mlp_mult=args.mlp_mult,
             num_gpus=args.num_gpus,
+            extra_env={
+                "TTT_ENABLED": "1" if args.ttt else "0",
+                "EVAL_STRIDE": "64",
+            },
         )
         results["baseline"] = extract_metrics(baseline_out)
 
@@ -364,9 +397,15 @@ def main():
         from bese_fast_bpe import FastBESEBPETokenizer
         tok = FastBESEBPETokenizer.load(str(tok_path))
 
-        # BESE: configurable architecture
+        # BESE: winning architecture + BESE tokenizer
+        bese_extra_env = {
+            "BESE_TOKENIZER_ROOT": str(BESE_DIR / "tokenizer"),
+            "EVAL_STRIDE": "64",
+            "TTT_ENABLED": "1" if args.ttt else "0",
+            "SLOT_ENABLED": "1" if args.slot else "0",
+        }
         bese_out = run_training(
-            name="bese_v2",
+            name="bese_v3",
             data_path=BESE_SHARD_DIR,
             tokenizer_path=tok_path,
             vocab_size=tok.vocab_size,
@@ -375,22 +414,32 @@ def main():
             model_dim=args.model_dim,
             mlp_mult=args.mlp_mult,
             num_gpus=args.num_gpus,
-            extra_env={"BESE_TOKENIZER_ROOT": str(BESE_DIR / "tokenizer")},
+            extra_env=bese_extra_env,
         )
         results["bese"] = extract_metrics(bese_out)
 
     # Step 5: Report
     step("RESULTS SUMMARY")
-    for name, (loss, bpb, size) in results.items():
+    for name, metrics in results.items():
+        best = metrics.get("best_bpb", "N/A")
+        sliding = metrics.get("sliding_bpb", "N/A")
+        ttt = metrics.get("ttt_bpb", "N/A")
+        slot = metrics.get("slot_bpb", "N/A")
+        int6 = metrics.get("int6_bpb", "N/A")
+        size = metrics.get("size_bytes")
         size_str = f"{size/1e6:.2f} MB" if size else "N/A"
-        print(f"  {name:20s}: val_loss={loss or 'N/A':>8} val_bpb={bpb or 'N/A':>8} size={size_str}")
+        model_size = metrics.get("model_bytes")
+        model_str = f"{model_size/1e6:.2f} MB" if model_size else "N/A"
+        print(f"  {name}:")
+        print(f"    best_bpb={best}  sliding={sliding}  ttt={ttt}  slot={slot}")
+        print(f"    int6_bpb={int6}  model={model_str}  total={size_str}")
 
     if "baseline" in results and "bese" in results:
-        b_bpb = results["baseline"][1]
-        e_bpb = results["bese"][1]
+        b_bpb = results["baseline"].get("best_bpb")
+        e_bpb = results["bese"].get("best_bpb")
         if b_bpb and e_bpb:
             diff = e_bpb - b_bpb
-            print(f"\n  Difference: {diff:+.4f} BPB ({'BESE better' if diff < 0 else 'Baseline better'})")
+            print(f"\n  BESE vs Baseline: {diff:+.4f} BPB ({'BESE better' if diff < 0 else 'Baseline better'})")
 
     total = time.time() - t_start
     print(f"\n  Total wall time: {total/60:.1f} min")

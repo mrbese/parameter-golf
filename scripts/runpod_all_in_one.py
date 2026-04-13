@@ -26,8 +26,8 @@ SHARD_DIR = PG_DIR / "data/datasets/fineweb10B_sp1024"
 TOK_DIR = BESE_DIR / "tokenizers"
 BESE_SHARD_DIR = Path("/workspace/bese_shards")
 
-MAX_DOCS = 10_000
-NUM_MERGES = 248
+MAX_DOCS = int(os.environ.get("MAX_DOCS", 200_000))
+NUM_MERGES = int(os.environ.get("NUM_MERGES", 4000))
 
 sys.path.insert(0, str(BESE_DIR / "tokenizer"))
 
@@ -37,37 +37,43 @@ def step(msg):
 
 
 def decode_shards():
-    """Decode SP binary shard back to text JSONL."""
-    step(f"STEP 1: Decoding up to {MAX_DOCS} docs from SP shard")
+    """Decode SP binary shards back to text JSONL.  Reads multiple shards if needed."""
+    step(f"STEP 1: Decoding up to {MAX_DOCS} docs from SP shards")
     import sentencepiece as spm
 
     sp = spm.SentencePieceProcessor(model_file=str(SP_MODEL))
     bos = sp.bos_id()
-
-    shard = SHARD_DIR / "fineweb_train_000000.bin"
     header_bytes = 256 * np.dtype("<i4").itemsize
-    header = np.fromfile(shard, dtype="<i4", count=256)
-    n = int(header[2])
-    tokens = np.fromfile(shard, dtype="<u2", count=n, offset=header_bytes)
-    print(f"  Loaded {n:,} tokens")
+
+    shard_files = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
+    if not shard_files:
+        raise FileNotFoundError(f"No train shards in {SHARD_DIR}")
 
     docs = []
-    current = []
-    for t in tokens:
-        if t == bos:
-            if current:
-                text = sp.decode(current)
-                if len(text.strip()) > 50:
-                    docs.append(text)
-                    if len(docs) >= MAX_DOCS:
-                        break
-            current = []
-        else:
-            current.append(int(t))
-    if current and len(docs) < MAX_DOCS:
-        text = sp.decode(current)
-        if len(text.strip()) > 50:
-            docs.append(text)
+    for shard in shard_files:
+        if len(docs) >= MAX_DOCS:
+            break
+        header = np.fromfile(shard, dtype="<i4", count=256)
+        n = int(header[2])
+        tokens = np.fromfile(shard, dtype="<u2", count=n, offset=header_bytes)
+        print(f"  Shard {shard.name}: {n:,} tokens")
+
+        current = []
+        for t in tokens:
+            if t == bos:
+                if current:
+                    text = sp.decode(current)
+                    if len(text.strip()) > 50:
+                        docs.append(text)
+                        if len(docs) >= MAX_DOCS:
+                            break
+                current = []
+            else:
+                current.append(int(t))
+        if current and len(docs) < MAX_DOCS:
+            text = sp.decode(current)
+            if len(text.strip()) > 50:
+                docs.append(text)
 
     out = BESE_DIR / "decoded_docs.jsonl"
     with out.open("w") as f:

@@ -3,10 +3,13 @@ Shared BESE alphabet constants and lookup tables (40-token base vocabulary).
 
 Used by bese_tokenizer.py and bese_bpe_tokenizer.py — single source of truth.
 
+v3: Reordered groups by aggregate frequency (most common group → lowest ID).
+    Group 15 (ufbz, 6.57%) > Group 16 (cwvj, 6.35%) > Group 17 (mykx, 5.35%) > Group 18 (gpq, 4.0%).
+    The group token ID itself now encodes frequency tier information.
+
 v2: Promoted h, d, l to single-token letters (8→11 singles).
     Regrouped remaining 15 letters into 4 groups (5→4 groups).
     Reordered positions within groups by frequency (most freq → P1).
-    Saves ~10.5% sequence length for -2 BPE merges.
 """
 
 from __future__ import annotations
@@ -29,10 +32,10 @@ SINGLE_LETTER_START = 4
 # DIFFERENT groups to give BPE cleaner merge patterns.
 GROUP_START = 15
 GROUPS = [
-    "cwvj",  # Group 15: c(2.8%) w(2.4%) v(1.0%) j(0.15%)
-    "ufbz",  # Group 16: u(2.8%) f(2.2%) b(1.5%) z(0.07%)
-    "mykx",  # Group 17: m(2.4%) y(2.0%) k(0.8%) x(0.15%)
-    "gpq",   # Group 18: g(2.0%) p(1.9%) q(0.10%)
+    "ufbz",  # Group 15: u(2.8%) f(2.2%) b(1.5%) z(0.07%) — 6.57% aggregate
+    "cwvj",  # Group 16: c(2.8%) w(2.4%) v(1.0%) j(0.15%) — 6.35% aggregate
+    "mykx",  # Group 17: m(2.4%) y(2.0%) k(0.8%) x(0.15%) — 5.35% aggregate
+    "gpq",   # Group 18: g(2.0%) p(1.9%) q(0.10%)          — 4.00% aggregate
 ]
 
 POS_START = 19
