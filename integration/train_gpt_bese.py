@@ -98,8 +98,18 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # SLOT (Sparse Linear Online Training) — L-BFGS test-time adaptation.
+    slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
+    slot_eval_seq_len = int(os.environ.get("SLOT_EVAL_SEQ_LEN", 2048))
+    slot_stride = int(os.environ.get("SLOT_STRIDE", 96))
+    slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
+    slot_steps = int(os.environ.get("SLOT_STEPS", 8))
+    slot_lr = float(os.environ.get("SLOT_LR", 0.1))
+    slot_lbfgs_max_iter = int(os.environ.get("SLOT_LBFGS_MAX_ITER", 5))
+    slot_lbfgs_history = int(os.environ.get("SLOT_LBFGS_HISTORY", 10))
+
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
 # 
 # As borrowed from modded-nanogpt
@@ -288,6 +298,176 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_slot(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """SLOT eval: L-BFGS test-time adaptation on frozen model hidden states.
+
+    For each batch of sliding windows, optimizes a tiny (delta, logit_bias) pair
+    to minimize cross-entropy, then scores with the optimized parameters.
+    Follows the score-first protocol: model is frozen, only delta/logit_bias adapt.
+    """
+    seq_len = args.slot_eval_seq_len
+    stride = args.slot_stride
+    batch_seqs = args.slot_batch_seqs
+    softcap = args.logit_softcap
+
+    base_model.eval()
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+
+    # Get projection weight (tied embeddings or lm_head)
+    if base_model.tie_embeddings:
+        proj_w = base_model.tok_emb.weight.detach().float()  # (V, D)
+    else:
+        proj_w = base_model.lm_head.weight.detach().float()  # (V, D)
+
+    vocab_size, model_dim = proj_w.shape
+
+    # Compile forward_hidden for speed
+    compiled_hidden = torch.compile(base_model.forward_hidden, fullgraph=False, mode="reduce-overhead")
+
+    # Build sliding windows: each window is seq_len+1 tokens (input + 1 target)
+    # score_offset = position within window where scoring starts
+    # First window scores all tokens; subsequent windows only score the new tail
+    total_tokens = val_tokens.numel()
+    windows: list[tuple[int, int]] = []  # (start, score_offset) pairs
+    pos = 0
+    first = True
+    while pos + seq_len < total_tokens:
+        score_offset = 0 if first else (seq_len - stride)
+        windows.append((pos, score_offset))
+        pos += stride
+        first = False
+
+    # Distribute windows across ranks
+    my_windows = windows[rank::world_size]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    log_fn = print if rank == 0 else lambda *a, **k: None
+    total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
+    t_start = time.perf_counter()
+
+    for batch_idx in range(0, len(my_windows), batch_seqs):
+        batch_windows = my_windows[batch_idx : batch_idx + batch_seqs]
+        bsz = len(batch_windows)
+
+        # Gather input sequences and build scoring mask
+        input_seqs = []
+        target_seqs = []
+        masks = []
+        for win_start, score_offset in batch_windows:
+            tokens_slice = val_tokens[win_start : win_start + seq_len + 1].to(device)
+            input_seqs.append(tokens_slice[:-1])    # (seq_len,)
+            target_seqs.append(tokens_slice[1:])     # (seq_len,)
+            # Mask: only score "new" tokens (after score_offset)
+            mask = torch.zeros(seq_len, device=device)
+            mask[score_offset:] = 1.0
+            masks.append(mask)
+
+        inputs = torch.stack(input_seqs)     # (bsz, seq_len)
+        targets = torch.stack(target_seqs)   # (bsz, seq_len)
+        mask = torch.stack(masks)            # (bsz, seq_len)
+        targets_flat = targets.reshape(-1)
+
+        # Frozen forward pass → hidden states
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            hidden = compiled_hidden(inputs)  # (bsz, seq_len, model_dim)
+        hidden_f = hidden.detach().float()  # detach to float32 for SLOT
+
+        # SLOT parameters: delta offsets hidden states, logit_bias offsets logits
+        delta = torch.zeros(bsz, 1, model_dim, device=device, dtype=torch.float32, requires_grad=True)
+        logit_bias = torch.zeros(bsz, 1, vocab_size, device=device, dtype=torch.float32, requires_grad=True)
+
+        valid_count = mask.sum()
+        if valid_count == 0:
+            continue
+
+        optimizer = torch.optim.LBFGS(
+            [delta, logit_bias],
+            lr=args.slot_lr,
+            max_iter=args.slot_lbfgs_max_iter,
+            history_size=args.slot_lbfgs_history,
+            line_search_fn="strong_wolfe",
+        )
+
+        # L-BFGS optimization: slot_steps outer steps
+        for _ in range(args.slot_steps):
+            def closure():
+                optimizer.zero_grad()
+                h = hidden_f + delta                           # (bsz, seq_len, model_dim)
+                lp = F.linear(h, proj_w) + logit_bias          # (bsz, seq_len, vocab_size)
+                lg = softcap * torch.tanh(lp / softcap)       # logit softcap
+                nll = F.cross_entropy(
+                    lg.reshape(-1, vocab_size), targets_flat, reduction="none"
+                ).reshape(bsz, seq_len)
+                loss = (nll * mask).sum() / valid_count
+                loss.backward()
+                return loss
+            optimizer.step(closure)
+
+        # Final scoring with optimized SLOT params
+        with torch.no_grad():
+            h = hidden_f + delta
+            lp = F.linear(h, proj_w) + logit_bias
+            lg = softcap * torch.tanh(lp / softcap)
+            nll = F.cross_entropy(
+                lg.reshape(-1, vocab_size), targets_flat, reduction="none"
+            ).reshape(bsz, seq_len)
+
+            # Accumulate loss and bytes (only for masked positions)
+            batch_loss = (nll * mask).sum()
+            batch_tokens = valid_count
+            loss_sum += batch_loss.to(torch.float64)
+            token_count += batch_tokens.to(torch.float64)
+
+            # Byte counting for BPB (same logic as eval_val)
+            for i in range(bsz):
+                _, score_offset = batch_windows[i]
+                tgt = targets[i, score_offset:]
+                prev = inputs[i, score_offset:]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+        if rank == 0 and (batch_idx // batch_seqs) % 10 == 0:
+            elapsed = time.perf_counter() - t_start
+            done = batch_idx // batch_seqs + 1
+            log_fn(
+                f"  slot batch {done}/{total_batches} "
+                f"running_bpb:{(loss_sum / max(token_count, 1)).item() / math.log(2.0) * (token_count / max(byte_count, 1)).item():.4f} "
+                f"elapsed:{elapsed:.0f}s"
+            )
+
+    # All-reduce across ranks
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+
+    base_model.train()
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+
+    return float(val_loss), float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -710,6 +890,21 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+        """Return final hidden states (before projection). Used by SLOT eval."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1183,6 +1378,36 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # -----------------------------
+    # SLOT EVAL (L-BFGS test-time adaptation)
+    # -----------------------------
+    if args.slot_enabled:
+        log0("Starting SLOT eval (L-BFGS test-time adaptation)...")
+        torch.cuda.synchronize()
+        t_slot = time.perf_counter()
+        slot_val_loss, slot_val_bpb = eval_val_slot(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        slot_elapsed = time.perf_counter() - t_slot
+        log0(
+            f"slot_lbfgs val_loss:{slot_val_loss:.4f} val_bpb:{slot_val_bpb:.4f} "
+            f"eval_time:{slot_elapsed:.0f}s"
+        )
+        log0(f"slot_lbfgs_exact val_loss:{slot_val_loss:.8f} val_bpb:{slot_val_bpb:.8f}")
+        log0(
+            f"slot_improvement: {q_val_bpb:.4f} -> {slot_val_bpb:.4f} "
+            f"(delta:{slot_val_bpb - q_val_bpb:.4f})"
+        )
 
     if distributed:
         dist.destroy_process_group()
