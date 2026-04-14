@@ -2001,6 +2001,11 @@ def main() -> None:
     training_time_ms = 0.0
     approx_training_time_ms = 0.0  # v5: init before training loop (used for recurrence activation)
     stop_after_step: int | None = None
+    # v5.3: warm up NS5 compile before the 600s clock starts — first call triggers JIT
+    if torch.cuda.is_available():
+        _warmup_g = torch.randn(8, 8, device=device, dtype=torch.bfloat16)
+        zeropower_via_newtonschulz5(_warmup_g)
+        del _warmup_g
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0

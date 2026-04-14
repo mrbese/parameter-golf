@@ -311,6 +311,55 @@ def _encode_chunk(args: tuple) -> "np.ndarray":
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# N-gram table build (called from both full prep and --skip-prep path)
+# ---------------------------------------------------------------------------
+def _build_ngram_table() -> None:
+    """Build (or rebuild) the n-gram frequency table.
+
+    Always deletes any existing table before rebuilding so a stale max-n value
+    (e.g. a max-n=4 table left over from v5) cannot be picked up by v5.3.
+    No-ops when NGRAM_TILT_ENABLED=0.
+    """
+    if TRAIN_ENV.get("NGRAM_TILT_ENABLED", "0") == "0":
+        log("  N-gram tilt disabled — skipping table build")
+        return
+
+    max_n = TRAIN_ENV.get("NGRAM_TILT_MAX_N", "3")
+
+    # Always remove existing table — it may have been built with a different max-n
+    if NGRAM_TABLE.exists():
+        NGRAM_TABLE.unlink()
+        log(f"  Removed existing n-gram table (rebuilding with max-n={max_n})")
+
+    banner(f"Build n-gram frequency table (max-n={max_n})")
+    first_shard = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
+    if not first_shard:
+        raise FileNotFoundError(f"No training shards found in {SHARD_DIR}")
+    run_cmd(
+        [
+            sys.executable,
+            str(BESE_DIR / "scripts" / "build_ngram_table.py"),
+            "--shard", str(first_shard[0]),
+            "--output", str(NGRAM_TABLE),
+            "--max-n", max_n,
+            "--top-k", "1",
+        ],
+        cwd=BESE_DIR,
+        label="ngram table",
+    )
+    if NGRAM_TABLE.exists():
+        ngram_size = NGRAM_TABLE.stat().st_size
+        log(f"  N-gram table size: {ngram_size:,} bytes ({ngram_size / 1024 / 1024:.2f} MB)")
+        # Model INT6+LZMA is ~11 MB; artifact budget is 16 MB → ~4.9 MB headroom.
+        # LZMA ratio for ngram tables is roughly 5-10x, so flag raw tables > 4 MB.
+        if ngram_size > 4_000_000:
+            log(
+                f"  WARNING: N-gram table is {ngram_size / 1024 / 1024:.1f} MB raw. "
+                "LZMA ~5-10x compression; verify artifact total < 16 MB after run."
+            )
+
+
 # Phase 0: Data Preparation (untimed) — in-memory decode pipeline
 # ---------------------------------------------------------------------------
 def phase0_data_prep() -> None:
@@ -504,34 +553,9 @@ def phase0_data_prep() -> None:
     del train_docs, val_docs
 
     # ------------------------------------------------------------------
-    # Step 0.6 — Build n-gram table (skipped if NGRAM_TILT_ENABLED=0)
+    # Step 0.6 — Build n-gram table
     # ------------------------------------------------------------------
-    if TRAIN_ENV.get("NGRAM_TILT_ENABLED", "0") == "0":
-        log("  Step 0.6: N-gram tilt disabled — skipping table build (saves ~10 min + 10.9 MB)")
-    elif NGRAM_TABLE.exists():
-        log(f"  Step 0.6: N-gram table already exists at {NGRAM_TABLE}, skipping")
-    else:
-        banner("Step 0.6: Build n-gram frequency table")
-        first_shard = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
-        if not first_shard:
-            raise FileNotFoundError(f"No training shards found in {SHARD_DIR}")
-        run_cmd(
-            [
-                sys.executable,
-                str(BESE_DIR / "scripts" / "build_ngram_table.py"),
-                "--shard", str(first_shard[0]),
-                "--output", str(NGRAM_TABLE),
-                "--max-n", "3",   # v5.3: max-n=3 fits budget; max-n=4 was 10.9 MB raw
-                "--top-k", "1",
-            ],
-            cwd=BESE_DIR,
-            label="ngram table",
-        )
-        if NGRAM_TABLE.exists():
-            ngram_size = NGRAM_TABLE.stat().st_size
-            log(f"  N-gram table size: {ngram_size:,} bytes ({ngram_size / 1024:.1f} KB)")
-            if ngram_size > 500_000:
-                log("  WARNING: N-gram table exceeds 500 KB target. Consider --max-n 3 or fewer tokens.")
+    _build_ngram_table()
 
     elapsed = time.time() - t0
     log(f"\n  Phase 0 total: {elapsed:.1f}s ({elapsed / 60:.1f} min)")
@@ -735,6 +759,9 @@ def main() -> None:
             )
         log(f"  Found tokenizer: {BPE_OUTPUT}")
         log(f"  Found {len(train_shards)} training shards in {SHARD_DIR}")
+        # Always rebuild ngram table even under --skip-prep: the existing table may
+        # have been built with a different max-n (e.g. v5 used max-n=4, v5.3 uses max-n=3)
+        _build_ngram_table()
     else:
         phase0_data_prep()
 
