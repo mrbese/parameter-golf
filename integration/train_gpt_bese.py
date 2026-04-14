@@ -10,13 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
-try:
-    import zstandard
-    _COMPRESSOR = "zstd"
-except ImportError:
-    _COMPRESSOR = "zlib"
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -388,9 +382,6 @@ class NgramTilt:
         self.vocab_size = vocab_size
         self.beta = beta
         self.max_n = max_n
-        self.live_table: dict[int, dict[tuple, dict[int, int]]] = {
-            n: {} for n in range(2, max_n + 1)
-        }
         self.prior_table: dict | None = None
         # Dense lookup tensors for vectorized tilt (populated by load_prior)
         self.bigram_arr: "Tensor | None" = None   # shape [V]
@@ -427,43 +418,6 @@ class NgramTilt:
                 if top_list:
                     arr[prev2, prev1] = top_list[0][0]
             self.trigram_arr = arr
-
-    def update(self, context_ids: list[int], new_token: int) -> None:
-        """Update live table with ground truth (causal — uses prefix only)."""
-        for n in range(2, self.max_n + 1):
-            if len(context_ids) >= n - 1:
-                prefix = tuple(context_ids[-(n - 1):])
-                if prefix not in self.live_table[n]:
-                    self.live_table[n][prefix] = {}
-                counts = self.live_table[n][prefix]
-                counts[new_token] = counts.get(new_token, 0) + 1
-
-    def tilt_logits(self, logits: Tensor, context_ids: list[int]) -> Tensor:
-        """Apply n-gram hint tilt to logits. logits shape: [vocab_size]."""
-        hint = torch.zeros_like(logits)
-        for n in range(2, self.max_n + 1):
-            if len(context_ids) >= n - 1:
-                prefix = tuple(context_ids[-(n - 1):])
-                # Check live table first (more recent)
-                if prefix in self.live_table[n]:
-                    counts = self.live_table[n][prefix]
-                    if counts:
-                        best = max(counts, key=counts.get)
-                        hint[best] += 1.0
-                elif self.prior_table and n in self.prior_table and prefix in self.prior_table[n]:
-                    top = self.prior_table[n][prefix]
-                    if top:
-                        best_token = top[0][0]  # top-k=1 format: [(token, count)]
-                        hint[best_token] += 0.5
-        return logits + self.beta * hint
-
-    def tilt_logits_batch(self, logits: Tensor, all_context_ids: list[list[int]]) -> Tensor:
-        """Apply n-gram tilt to batched logits. logits shape: [batch, seq, vocab]."""
-        for b in range(logits.shape[0]):
-            for t in range(logits.shape[1]):
-                if len(all_context_ids[b]) > 0:
-                    logits[b, t] = self.tilt_logits(logits[b, t], all_context_ids[b][:t + 1])
-        return logits
 
 
 # --- Quantization helpers ---
@@ -905,7 +859,6 @@ class GPT(nn.Module):
         else:
             self.ve_shared = None
             self.ve_layer_scales = nn.ParameterList()
-        self.value_embeds = nn.ModuleList()  # keep empty for compat
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1067,17 +1020,6 @@ class GPT(nn.Module):
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-    def forward_hidden(self, input_ids: Tensor) -> Tensor:
-        """Return final hidden states (before projection)."""
-        x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
-        x0 = x
-        ve_cache: dict = {}
-        x = self._run_layers(x, x0, input_ids, ve_cache)
-        return self.final_norm(x)
 
 # --- Sliding window evaluation ---
 
@@ -1277,7 +1219,6 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
-    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1310,7 +1251,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
         if info is None:
             continue
         orig_dtype = orig.dtype
-        if info in ("passthrough", "passthrough_ctrl", "passthrough_fp16"):
+        if info in ("passthrough", "passthrough_ctrl"):
             t = result[name]
             if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
                 t = t.to(orig_dtype)

@@ -181,7 +181,7 @@ def extract_metrics(output: str) -> dict:
     metrics: dict = {}
     for line in output.strip().split("\n"):
         # Sliding window BPB
-        if "final_int8_zlib_roundtrip_exact" in line and "val_bpb:" in line:
+        if "final_int6_lzma_roundtrip_exact" in line and "val_bpb:" in line:
             for part in line.split():
                 if part.startswith("val_bpb:"):
                     metrics["sliding_bpb"] = float(part.split(":")[1])
