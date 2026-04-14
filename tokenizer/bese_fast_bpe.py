@@ -86,35 +86,53 @@ class _Node:
         self.doc_id = doc_id
 
 
+def _encode_texts_worker(texts: list[str]) -> list[list[int]]:
+    """Worker function for parallel base-token encoding."""
+    return [_text_to_base_tokens(text) for text in texts]
+
+
 def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool = True) -> list:
     """
     Learn BPE merges using an efficient indexed approach.
 
     Instead of scanning all sequences for every merge, we:
-    1. Build a doubly-linked list of all tokens
-    2. Maintain a dict mapping each pair -> set of positions where it occurs
+    1. Build a doubly-linked list of all tokens (encoding parallelized across CPUs)
+    2. Maintain a max-heap of pair counts for O(log n) best-pair lookup
     3. For each merge, update only the affected positions
 
-    This is O(total_tokens + num_merges * avg_pair_count) instead of
+    This is O(total_tokens + num_merges * avg_pair_count * log(num_pairs)) instead of
     O(num_merges * total_tokens).
     """
+    import multiprocessing as mp
+
     if verbose:
         print(f"Encoding {len(texts)} texts with base BESE tokenizer...")
 
-    # Step 1: Encode all texts to base tokens and build linked lists
-    doc_heads = []  # head node of each document's linked list
-    pair_positions = defaultdict(set)  # (a, b) -> set of node_ids where pair starts
-    all_nodes = []  # flat list for node_id -> node mapping
+    # Step 1: Parallel encode all texts to base tokens
+    n_workers = min(mp.cpu_count(), 128)
+    chunk_size = max(1, len(texts) // n_workers)
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+    import time as _time
+    t_enc = _time.time()
+    with mp.Pool(n_workers) as pool:
+        encoded_chunks = pool.map(_encode_texts_worker, chunks)
+    all_encoded = [tokens for chunk in encoded_chunks for tokens in chunk]
+    if verbose:
+        print(f"  Parallel encoding: {n_workers} workers, {_time.time() - t_enc:.1f}s")
+
+    # Step 1b: Build linked lists and pair index from encoded tokens
+    doc_heads = []
+    pair_positions = defaultdict(set)
+    all_nodes = []
 
     total_base = 0
-    for doc_id, text in enumerate(texts):
-        base_tokens = _text_to_base_tokens(text)
+    for doc_id, base_tokens in enumerate(all_encoded):
         total_base += len(base_tokens)
         if not base_tokens:
             doc_heads.append(None)
             continue
 
-        # Build linked list for this document
         nodes = []
         for t in base_tokens:
             node = _Node(t, doc_id)
@@ -128,32 +146,38 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
 
         doc_heads.append(len(all_nodes) - len(nodes))
 
-        # Index pairs
         for i in range(len(nodes) - 1):
             nid = len(all_nodes) - len(nodes) + i
             pair = (nodes[i].token, nodes[i + 1].token)
             pair_positions[pair].add(nid)
 
+    del all_encoded
+
     if verbose:
         print(f"Base tokens: {total_base:,}")
         print(f"Unique pairs: {len(pair_positions):,}")
-        print(f"Learning {num_merges} BPE merges (fast mode)...")
+        print(f"Learning {num_merges} BPE merges (heap mode)...")
 
-    # Step 2: Greedily merge most frequent pairs
+    # Step 2: Greedily merge most frequent pairs using a max-heap
     merges = []
     next_id = BASE_VOCAB_SIZE
 
-    # Build a count index: we track counts separately for O(1) lookup
     pair_counts = {pair: len(positions) for pair, positions in pair_positions.items()}
 
+    # Build max-heap (negate counts for max-heap via min-heap)
+    heap = [(-count, pair) for pair, count in pair_counts.items() if count >= 2]
+    heapq.heapify(heap)
+
     merge_num = 0
-    while merge_num < num_merges:
-        # Find the most frequent pair
-        if not pair_counts:
-            break
-        best_pair = max(pair_counts, key=pair_counts.get)
-        best_count = pair_counts[best_pair]
-        if best_count < 2:
+    while merge_num < num_merges and heap:
+        # Pop best pair from heap (skip stale entries)
+        while heap:
+            neg_count, best_pair = heapq.heappop(heap)
+            current_count = pair_counts.get(best_pair, 0)
+            if current_count >= 2 and current_count == -neg_count:
+                best_count = current_count
+                break
+        else:
             break
 
         # Get all positions where this pair occurs and filter stale entries
@@ -219,18 +243,22 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
             if node_b.next is not None:
                 all_nodes[node_b.next].prev = nid
 
-            # Add new pairs
+            # Add new pairs and push onto heap
             if node_a.prev is not None:
                 prev_node = all_nodes[node_a.prev]
                 new_left_pair = (prev_node.token, new_id)
                 pair_positions.setdefault(new_left_pair, set()).add(node_a.prev)
-                pair_counts[new_left_pair] = pair_counts.get(new_left_pair, 0) + 1
+                new_count = pair_counts.get(new_left_pair, 0) + 1
+                pair_counts[new_left_pair] = new_count
+                heapq.heappush(heap, (-new_count, new_left_pair))
 
             if node_a.next is not None:
                 next_node = all_nodes[node_a.next]
                 new_right_pair = (new_id, next_node.token)
                 pair_positions.setdefault(new_right_pair, set()).add(nid)
-                pair_counts[new_right_pair] = pair_counts.get(new_right_pair, 0) + 1
+                new_count = pair_counts.get(new_right_pair, 0) + 1
+                pair_counts[new_right_pair] = new_count
+                heapq.heappush(heap, (-new_count, new_right_pair))
 
         next_id += 1
         merge_num += 1
