@@ -323,6 +323,17 @@ def phase0_data_prep() -> None:
 
     sys.path.insert(0, str(BESE_DIR / "tokenizer"))
 
+    # Pre-spawn encode pool NOW while the process is still tiny.
+    # CRITICAL: Never create a Pool after loading large data — fork() copies the
+    # parent's page table for every worker. At 100 GB RSS that's ~200 MB of PTEs
+    # × N workers = minutes of OS work with CPUs sitting idle.
+    ENCODE_WORKERS = min(mp.cpu_count(), 128)
+    ENCODE_CHUNK = 5000
+    bese_tok_root = str(BESE_DIR / "tokenizer")
+    tok_path = str(BPE_OUTPUT)
+    log(f"  Pre-spawning {ENCODE_WORKERS} encode workers (process is still small)...")
+    encode_pool = mp.Pool(ENCODE_WORKERS)
+
     # ------------------------------------------------------------------
     # Step 0.1 — Parallel decode SP shards → text strings in memory
     # ------------------------------------------------------------------
@@ -360,18 +371,15 @@ def phase0_data_prep() -> None:
     log(f"  Decode time: {elapsed_decode:.1f}s ({elapsed_decode / 60:.1f} min)")
 
     # ------------------------------------------------------------------
-    # Step 0.2 — Quality filter in-memory (parallel)
+    # Step 0.2 — Quality filter in-memory (single-threaded)
+    # NOTE: Parallelizing filter/sort requires forking AFTER 100 GB of docs
+    # are loaded, which makes fork() extremely slow (page-table copy overhead).
+    # Single-threaded filter is ~30s — fast enough.
     # ------------------------------------------------------------------
-    banner("Step 0.2: Quality filter (is_high_value) — parallel")
+    banner("Step 0.2: Quality filter (is_high_value)")
     t_filt = time.time()
     before = len(train_docs)
-    N_WORKERS = min(mp.cpu_count(), 200)
-    PREP_CHUNK = 5000  # small chunks so each pickled task is ~5 MB, not ~31 MB
-    chunks = [train_docs[i:i + PREP_CHUNK] for i in range(0, len(train_docs), PREP_CHUNK)]
-    log(f"  Filtering {before:,} docs across {len(chunks)} chunks with {N_WORKERS} workers...")
-    with mp.Pool(N_WORKERS) as pool:
-        filtered_chunks = list(pool.imap(_filter_chunk, chunks, chunksize=1))
-    train_docs = [d for chunk in filtered_chunks for d in chunk]
+    train_docs = [d for d in train_docs if _is_high_value(d)]
     log(f"  Filtered {before:,} → {len(train_docs):,} docs ({before - len(train_docs):,} removed)")
     log(f"  Filter time: {time.time() - t_filt:.1f}s")
 
@@ -396,16 +404,14 @@ def phase0_data_prep() -> None:
         log(f"  Saved tokenizer to {BPE_OUTPUT} ({time.time() - t_bpe:.1f}s)")
 
     # ------------------------------------------------------------------
-    # Step 0.4 — Curriculum sort in-memory (parallel score, then sort)
+    # Step 0.4 — Curriculum sort in-memory (single-threaded scoring)
+    # Same reason as Step 0.2: fork after 100 GB load is too slow.
+    # Single-threaded scoring ~30s, then Python timsort.
     # ------------------------------------------------------------------
-    banner("Step 0.4: Curriculum sort (easy → hard) — parallel scoring")
+    banner("Step 0.4: Curriculum sort (easy → hard)")
     t_sort = time.time()
-    score_chunks = [train_docs[i:i + PREP_CHUNK] for i in range(0, len(train_docs), PREP_CHUNK)]
-    log(f"  Scoring {len(train_docs):,} docs across {len(score_chunks)} chunks with {N_WORKERS} workers...")
-    with mp.Pool(N_WORKERS) as pool:
-        score_results = list(pool.imap(_score_chunk, score_chunks, chunksize=1))
-    scores = [s for chunk in score_results for s in chunk]
-    train_docs = [doc for _, doc in sorted(zip(scores, train_docs), key=lambda x: x[0])]
+    scores = [_difficulty_score(d) for d in train_docs]
+    train_docs = [doc for _, doc in sorted(zip(scores, train_docs))]
     log(f"  Sorted {len(train_docs):,} docs by difficulty ({time.time() - t_sort:.1f}s)")
 
     # ------------------------------------------------------------------
@@ -431,17 +437,11 @@ def phase0_data_prep() -> None:
                 f.write(tokens.astype("<u2").tobytes())
             return int(tokens.shape[0])
 
-        ENCODE_WORKERS = min(mp.cpu_count(), 128)
-        ENCODE_CHUNK = 5000  # docs per worker task
-        bese_tok_root = str(BESE_DIR / "tokenizer")
-        tok_path = str(BPE_OUTPUT)
-
-        # Encode + write val shard (parallel)
+        # Encode + write val shard using pre-spawned pool
         log(f"  Encoding {len(val_docs):,} validation docs (parallel, {ENCODE_WORKERS} workers)...")
         val_enc_chunks = [val_docs[i:i + ENCODE_CHUNK] for i in range(0, len(val_docs), ENCODE_CHUNK)]
         val_enc_args = [(c, tok_path, bese_tok_root) for c in val_enc_chunks]
-        with mp.Pool(ENCODE_WORKERS) as pool:
-            val_arrays = pool.map(_encode_chunk, val_enc_args)
+        val_arrays = encode_pool.map(_encode_chunk, val_enc_args)
         if val_arrays:
             val_tokens = np.concatenate(val_arrays)
             write_shard(SHARD_DIR / "fineweb_val_0.bin", val_tokens)
@@ -455,29 +455,28 @@ def phase0_data_prep() -> None:
             log(f"  Capping train docs: {len(train_docs):,} → {est_docs:,}")
             train_docs = train_docs[:est_docs]
 
-        # Encode train docs in parallel, write shards as token buffer fills
+        # Encode train docs using pre-spawned pool, write shards as buffer fills
         log(f"  Encoding {len(train_docs):,} training docs (parallel, {ENCODE_WORKERS} workers)...")
         train_enc_chunks = [train_docs[i:i + ENCODE_CHUNK] for i in range(0, len(train_docs), ENCODE_CHUNK)]
         train_enc_args = [(c, tok_path, bese_tok_root) for c in train_enc_chunks]
         shard_idx = 0
         buffer = []
         buffer_tokens = 0
-        with mp.Pool(ENCODE_WORKERS) as pool:
-            for chunk_idx, arr in enumerate(pool.imap(_encode_chunk, train_enc_args)):
-                buffer.append(arr)
-                buffer_tokens += len(arr)
-                if (chunk_idx + 1) % 20 == 0:
-                    log(f"    Encoded {(chunk_idx+1)*ENCODE_CHUNK:,}/{len(train_docs):,} docs, {buffer_tokens:,} tokens buffered")
-                while buffer_tokens >= SHARD_SIZE:
-                    combined = np.concatenate(buffer)
-                    shard_tokens = combined[:SHARD_SIZE]
-                    remainder = combined[SHARD_SIZE:]
-                    path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
-                    n = write_shard(path, shard_tokens)
-                    log(f"    Train shard {shard_idx}: {n:,} tokens")
-                    shard_idx += 1
-                    buffer = [remainder] if len(remainder) > 0 else []
-                    buffer_tokens = len(remainder)
+        for chunk_idx, arr in enumerate(encode_pool.imap(_encode_chunk, train_enc_args)):
+            buffer.append(arr)
+            buffer_tokens += len(arr)
+            if (chunk_idx + 1) % 20 == 0:
+                log(f"    Encoded {(chunk_idx+1)*ENCODE_CHUNK:,}/{len(train_docs):,} docs, {buffer_tokens:,} tokens buffered")
+            while buffer_tokens >= SHARD_SIZE:
+                combined = np.concatenate(buffer)
+                shard_tokens = combined[:SHARD_SIZE]
+                remainder = combined[SHARD_SIZE:]
+                path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
+                n = write_shard(path, shard_tokens)
+                log(f"    Train shard {shard_idx}: {n:,} tokens")
+                shard_idx += 1
+                buffer = [remainder] if len(remainder) > 0 else []
+                buffer_tokens = len(remainder)
         if buffer and buffer_tokens > 0:
             shard_tokens = np.concatenate(buffer)
             path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
@@ -486,6 +485,10 @@ def phase0_data_prep() -> None:
             shard_idx += 1
 
         log(f"  Exported {shard_idx} train shards + 1 val shard ({time.time() - t_export:.1f}s)")
+
+    # Shut down encode pool
+    encode_pool.close()
+    encode_pool.join()
 
     # Free memory
     del train_docs, val_docs
