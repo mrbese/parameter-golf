@@ -57,8 +57,8 @@ TRAIN_ENV = {
     "NUM_KV_HEADS": "4",
     "DEPTH_RECURRENCE_START": "3",
     "DEPTH_RECURRENCE_END": "5",
-    "DEPTH_RECURRENCE_LOOPS": "3",
-    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.35",
+    "DEPTH_RECURRENCE_LOOPS": "2",          # v5.1: was 3, recover ~1000 steps
+    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.50",  # v5.1: was 0.35, train normally longer
     "PARALLEL_RESIDUAL_START": "7",
     "QK_GAIN_INIT": "5.0",
     "MATRIX_LR": "0.022",
@@ -70,11 +70,8 @@ TRAIN_ENV = {
     "DATA_PATH": str(SHARD_DIR),
     "MAX_WALLCLOCK_SECONDS": "600",
     "SLOT_ENABLED": "1",
-    # v5: N-gram tilt at eval time
-    "NGRAM_TILT_ENABLED": "1",
-    "NGRAM_TILT_BETA": "0.3",
-    "NGRAM_TILT_MAX_N": "4",
-    "NGRAM_PRIOR_PATH": str(NGRAM_TABLE),
+    # v5.1: n-gram tilt disabled (table was 10.9 MB, blew 16 MB artifact limit)
+    "NGRAM_TILT_ENABLED": "0",
 }
 
 SIZE_LIMIT_BYTES = 16_000_000  # 16 MB hard limit
@@ -505,9 +502,11 @@ def phase0_data_prep() -> None:
     del train_docs, val_docs
 
     # ------------------------------------------------------------------
-    # Step 0.6 — Build n-gram table
+    # Step 0.6 — Build n-gram table (skipped if NGRAM_TILT_ENABLED=0)
     # ------------------------------------------------------------------
-    if NGRAM_TABLE.exists():
+    if TRAIN_ENV.get("NGRAM_TILT_ENABLED", "0") == "0":
+        log("  Step 0.6: N-gram tilt disabled — skipping table build (saves ~10 min + 10.9 MB)")
+    elif NGRAM_TABLE.exists():
         log(f"  Step 0.6: N-gram table already exists at {NGRAM_TABLE}, skipping")
     else:
         banner("Step 0.6: Build n-gram frequency table")
