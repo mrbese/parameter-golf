@@ -157,7 +157,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     return X
 
 # v5.3: compile NS5 — fuses the 5-iteration bmm loop into a single CUDA kernel launch
-zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, dynamic=True)
 
 # --- Parallel Muon optimizer ---
 
@@ -1174,6 +1174,7 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
+    ngram_tilt: "NgramTilt | None" = None,
 ) -> tuple[float, float]:
     """Sliding window evaluation: each token scored with maximum context."""
     seq_len = eval_seq_len or args.train_seq_len
@@ -1205,6 +1206,22 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
+            # v5.3: apply n-gram prior tilt before scoring
+            if ngram_tilt is not None and ngram_tilt.prior_table is not None:
+                logits_f = logits.float()
+                prior = ngram_tilt.prior_table
+                beta = ngram_tilt.beta
+                for i in range(bsz):
+                    ctx = x_batch[i, :wlens[i]].tolist()
+                    for t in range(wlens[i]):
+                        for n in range(2, ngram_tilt.max_n + 1):
+                            if t >= n - 1:
+                                prefix = tuple(ctx[t - n + 1:t])
+                                if n in prior and prefix in prior[n]:
+                                    top = prior[n][prefix]
+                                    if top:
+                                        logits_f[i, t, top[0][0]] += beta * 0.5
+                logits = logits_f
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 y_batch.reshape(-1),
@@ -2251,6 +2268,16 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    # v5.3: create n-gram tilt for sliding window eval (prior-only, no live updates)
+    _sw_ngram_tilt: NgramTilt | None = None
+    if args.ngram_tilt_enabled and args.ngram_prior_path:
+        _prior_path = os.environ.get("NGRAM_PRIOR_PATH", args.ngram_prior_path)
+        if os.path.exists(_prior_path):
+            _sw_ngram_tilt = NgramTilt(
+                args.vocab_size, beta=args.ngram_tilt_beta, max_n=args.ngram_tilt_max_n
+            )
+            _sw_ngram_tilt.load_prior(_prior_path)
+            log0(f"ngram_tilt: loaded prior for sliding window eval from {_prior_path}")
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
@@ -2260,6 +2287,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
             eval_seq_len=sw_seq_len,
+            ngram_tilt=_sw_ngram_tilt,
         )
         torch.cuda.synchronize()
         log0(
@@ -2276,6 +2304,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
             eval_seq_len=sw_seq_len,
+            ngram_tilt=_sw_ngram_tilt,
         )
         torch.cuda.synchronize()
         log0(
