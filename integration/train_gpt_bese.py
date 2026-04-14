@@ -100,6 +100,7 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32768))
 
     # v5: Depth recurrence (loop middle layers multiple times)
     depth_recurrence_start = int(os.environ.get("DEPTH_RECURRENCE_START", 3))
@@ -1138,48 +1139,60 @@ def _run_ttt_sliding_window_eval(
     ttt_epochs: int = 3,
     ttt_grad_clip: float = 1.0,
     ngram_tilt: "NgramTilt | None" = None,
+    chunk_size: int = 32768,
 ) -> tuple[float, float]:
     """
-    Legal TTT sliding window evaluation.
+    Legal TTT evaluation — FAST chunk-based version.
 
-    Protocol (score-first):
-      1. Score chunk N under inference_mode (no gradients, no weight mutation)
-      2. Train on chunk N's tokens for ttt_epochs with SGD
-      3. Move to chunk N+1
+    Score-first protocol:
+      1. Score chunk with non-overlapping seq_len windows (ONE pass per window, no stride)
+      2. Train on the SAME already-scored chunk with SGD
+      3. Move to next chunk
 
-    Every token is scored BEFORE any gradient update uses that token.
-    The model improves over evaluation by learning from already-scored tokens.
+    Speed: ~(1 + ttt_epochs) × (chunk_size / seq_len) forward passes per chunk.
+    With chunk_size=32K, seq_len=2048, 1 epoch: ~32 passes/chunk × ~2300 chunks = ~74K passes.
+    At ~4ms/pass on H100: ~5 min. (vs ~85 min for the old stride-64 version)
     """
     model.eval()
     original_state = copy.deepcopy(model.state_dict())
+
+    # Ensure all params are float32 for SGD (dequantized model may have mixed dtypes)
+    for p in model.parameters():
+        p.data = p.data.float()
 
     ttt_optimizer = torch.optim.SGD(
         model.parameters(), lr=ttt_lr, momentum=ttt_momentum
     )
 
-    total_tokens = val_tokens.shape[0]
-    loss_sum = 0.0
-    token_count = 0
-    byte_count = 0.0
+    n_tokens = val_tokens.shape[0]
+    total_nll = 0.0
+    total_base_bytes = 0.0
 
-    pos = 0
-    chunk_idx = 0
+    # Non-overlapping chunks for TTT
+    chunk_starts = list(range(0, n_tokens - 1, chunk_size))
+    n_chunks = len(chunk_starts)
 
-    while pos + seq_len < total_tokens:
-        chunk_end = min(pos + seq_len, total_tokens - 1)
+    for chunk_idx, chunk_start in enumerate(chunk_starts):
+        chunk_end = min(chunk_start + chunk_size, n_tokens - 1)
+        actual_chunk_len = chunk_end - chunk_start
+        if actual_chunk_len < 2:
+            continue
 
-        # === PHASE 1: SCORE (inference_mode — no weight mutation possible) ===
+        # === PHASE 1: SCORE with non-overlapping seq_len windows ===
         with torch.inference_mode():
-            window_start = pos
-            while window_start < chunk_end and window_start + seq_len < total_tokens:
-                window_end = min(window_start + seq_len, total_tokens - 1)
-                x = val_tokens[window_start:window_end].unsqueeze(0).to(dtype=torch.int64, device=device)
-                y = val_tokens[window_start + 1:window_end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
+            pos = chunk_start
+            while pos < chunk_end:
+                end = min(pos + seq_len, chunk_end)
+                if end - pos < 2:
+                    break
+
+                x = val_tokens[pos:end].unsqueeze(0).to(dtype=torch.int64, device=device)
+                y = val_tokens[pos + 1:end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = model.forward_logits(x)
 
-                # Apply n-gram tilt (same logic as eval_val_sliding)
+                # Apply n-gram tilt
                 if ngram_tilt is not None and ngram_tilt.prior_table is not None:
                     logits_f = logits.float()
                     delta = ngram_tilt.beta * 0.5
@@ -1198,66 +1211,68 @@ def _run_ttt_sliding_window_eval(
                             logits_f[b_idx, t_idx + 2, top_tok[b_idx, t_idx].long()] += delta
                     logits = logits_f
 
-                # Score tokens: first window gets all, subsequent get last stride
-                wlen = window_end - window_start
-                if window_start == pos:
-                    s = 0
-                else:
-                    s = max(wlen - stride, 0)
-
+                # Score ALL tokens in this window (single pass, no stride)
+                wlen = end - pos
                 nll = F.cross_entropy(
-                    logits[0, s:wlen].float(),
-                    y[0, s:wlen],
+                    logits[0, :wlen].float(),
+                    y[0, :wlen],
                     reduction="none",
                 )
-                loss_sum += nll.to(torch.float64).sum().item()
-                token_count += (wlen - s)
+                total_nll += nll.to(torch.float64).sum().item()
 
-                tgt = y[0, s:wlen]
-                prev = x[0, s:wlen]
+                tgt = y[0, :wlen]
+                prev = x[0, :wlen]
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum().item()
+                total_base_bytes += tb.sum().item()
 
-                window_start += stride
-                if window_start >= chunk_end:
-                    break
+                pos += seq_len  # non-overlapping — advance by full seq_len
 
-        # === PHASE 2: TRAIN on already-scored chunk (gradient updates OK) ===
-        is_last_chunk = (pos + seq_len >= total_tokens - seq_len)
-        if not is_last_chunk:
+        # === PHASE 2: TRAIN on already-scored chunk ===
+        is_last = (chunk_idx >= n_chunks - 1)
+        if not is_last:
             model.train()
-            x_train = val_tokens[pos:chunk_end].unsqueeze(0).to(dtype=torch.int64, device=device)
-            y_train = val_tokens[pos + 1:chunk_end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
 
             # Cosine LR decay across chunks
-            total_chunks = max((total_tokens - seq_len) // seq_len, 1)
-            cos_scale = 0.5 * (1.0 + math.cos(math.pi * chunk_idx / total_chunks))
+            cos_scale = 0.5 * (1.0 + math.cos(math.pi * chunk_idx / max(n_chunks - 1, 1)))
             for pg in ttt_optimizer.param_groups:
                 pg['lr'] = ttt_lr * cos_scale
 
-            for epoch in range(ttt_epochs):
-                ttt_optimizer.zero_grad()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(x_train, y_train)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), ttt_grad_clip)
-                ttt_optimizer.step()
+            # Train in seq_len-sized sub-windows
+            for _epoch in range(ttt_epochs):
+                train_pos = chunk_start
+                while train_pos < chunk_end:
+                    train_end = min(train_pos + seq_len, chunk_end)
+                    if train_end - train_pos < 2:
+                        break
+
+                    x_t = val_tokens[train_pos:train_end].unsqueeze(0).to(dtype=torch.int64, device=device)
+                    y_t = val_tokens[train_pos + 1:train_end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
+
+                    ttt_optimizer.zero_grad()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss = model(x_t, y_t)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), ttt_grad_clip)
+                    ttt_optimizer.step()
+
+                    train_pos += seq_len
 
             model.eval()
 
-        pos += seq_len
-        chunk_idx += 1
+        # Progress logging every 100 chunks
+        if chunk_idx % 100 == 0 or chunk_idx == n_chunks - 1:
+            partial_bpb = (total_nll / max(total_base_bytes, 1e-9)) / math.log(2)
+            print(f"  ttt_chunk:{chunk_idx}/{n_chunks} partial_bpb:{partial_bpb:.6f}", flush=True)
 
     # Restore original weights (TTT is eval-only, don't persist changes)
     model.load_state_dict(original_state)
 
-    if token_count == 0:
+    if total_base_bytes < 1e-9:
         return 0.0, 0.0
-    val_loss = loss_sum / token_count
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count / max(byte_count, 1e-9)
-    return val_loss, bits_per_token * tokens_per_byte
+    val_loss = total_nll / total_base_bytes
+    val_bpb = val_loss / math.log(2.0)
+    return val_loss, val_bpb
 
 
 # --- GPTQ-lite int6 quantization ---
@@ -2012,6 +2027,7 @@ def main() -> None:
             ttt_epochs=args.ttt_epochs,
             ttt_grad_clip=args.ttt_grad_clip,
             ngram_tilt=_sw_ngram_tilt,
+            chunk_size=args.ttt_chunk_size,
         )
         torch.cuda.synchronize()
         log0(
