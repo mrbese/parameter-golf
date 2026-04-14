@@ -69,7 +69,6 @@ TRAIN_ENV = {
     "TOKENIZER_PATH": str(BPE_OUTPUT),
     "DATA_PATH": str(SHARD_DIR),
     "MAX_WALLCLOCK_SECONDS": "600",
-    "SLOT_ENABLED": "1",
     # v5.3: n-gram tilt re-enabled with max-n=3 (max-n=4 was 10.9 MB; max-n=3 fits 16 MB budget)
     "NGRAM_TILT_ENABLED": "1",
     "NGRAM_TILT_MAX_N": "3",
@@ -194,15 +193,6 @@ def extract_metrics(output: str) -> dict:
                 if part.startswith("val_bpb:"):
                     metrics["int6_bpb"] = float(part.split(":")[1])
         # SLOT
-        if "slot_lbfgs_exact" in line:
-            for part in line.split():
-                if part.startswith("val_bpb:"):
-                    metrics["slot_bpb"] = float(part.split(":")[1])
-        # TTT
-        if "legal_ttt_exact" in line:
-            for part in line.split():
-                if part.startswith("val_bpb:"):
-                    metrics["ttt_bpb"] = float(part.split(":")[1])
         # Submission size
         if "Total submission size" in line and "bytes" in line:
             m = re.search(r"(\d+)\s*bytes", line)
@@ -214,11 +204,9 @@ def extract_metrics(output: str) -> dict:
             if m:
                 metrics["model_bytes"] = int(m.group(1))
 
-    # Best BPB: TTT > SLOT > sliding > int6
+    # Best BPB: sliding > int6
     metrics["best_bpb"] = (
-        metrics.get("ttt_bpb")
-        or metrics.get("slot_bpb")
-        or metrics.get("sliding_bpb")
+        metrics.get("sliding_bpb")
         or metrics.get("int6_bpb")
     )
     return metrics
@@ -288,16 +276,6 @@ def _difficulty_score(text: str) -> float:
 # ---------------------------------------------------------------------------
 # Parallel worker functions (must be top-level for multiprocessing pickling)
 # ---------------------------------------------------------------------------
-def _filter_chunk(docs: list) -> list:
-    """Filter a chunk of docs — runs in a worker process."""
-    return [d for d in docs if _is_high_value(d)]
-
-
-def _score_chunk(docs: list) -> list:
-    """Compute difficulty scores for a chunk of docs — runs in a worker process."""
-    return [_difficulty_score(d) for d in docs]
-
-
 def _encode_chunk(args: tuple) -> "np.ndarray":
     """Encode a chunk of docs with the BESE tokenizer — runs in a worker process."""
     docs, tok_path, bese_tok_root = args
@@ -661,8 +639,6 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
 
     best = metrics.get("best_bpb", "N/A")
     sliding = metrics.get("sliding_bpb", "N/A")
-    slot = metrics.get("slot_bpb", "N/A")
-    ttt = metrics.get("ttt_bpb", "N/A")
     int6 = metrics.get("int6_bpb", "N/A")
     size_bytes = metrics.get("size_bytes") or metrics.get("model_bytes")
     size_str = f"{size_bytes / 1_000_000:.2f} MB" if size_bytes else "N/A"
@@ -671,8 +647,6 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
 
     log(f"  best_bpb:    {best}")
     log(f"  sliding_bpb: {sliding}")
-    log(f"  slot_bpb:    {slot}")
-    log(f"  ttt_bpb:     {ttt}")
     log(f"  int6_bpb:    {int6}")
     log(f"  model_size:  {model_str}")
     log(f"  total_size:  {size_str}")
