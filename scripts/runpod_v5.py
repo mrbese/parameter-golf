@@ -417,7 +417,18 @@ def phase0_data_prep() -> None:
     # ------------------------------------------------------------------
     # Step 0.5 — Export BESE shards from in-memory texts
     # ------------------------------------------------------------------
+    # Consistency check: shards and tokenizer must both exist or both be absent.
+    # A partial prior run could leave one without the other, causing silent mismatch.
     train_shards_exist = list(SHARD_DIR.glob("fineweb_train_*.bin"))
+    if train_shards_exist and not BPE_OUTPUT.exists():
+        log(f"  WARNING: Found {len(train_shards_exist)} stale shards but no tokenizer — deleting stale shards")
+        for f in train_shards_exist:
+            f.unlink()
+        for f in SHARD_DIR.glob("fineweb_val_*.bin"):
+            f.unlink()
+        train_shards_exist = []
+    if not train_shards_exist and BPE_OUTPUT.exists():
+        log(f"  NOTE: Tokenizer exists but no shards found — will re-encode with existing tokenizer")
     if train_shards_exist:
         log(f"  Step 0.5: Found {len(train_shards_exist)} existing train shards in {SHARD_DIR}, skipping")
     else:
@@ -562,7 +573,7 @@ def phase1_training(num_gpus: int) -> str:
         str(TRAIN_SCRIPT),
     ]
 
-    output = run_cmd(cmd, env=env, cwd=BESE_DIR, label="torchrun")
+    output = run_cmd(cmd, env=env, cwd=BESE_DIR, label="torchrun", timeout=900)
     return output
 
 
