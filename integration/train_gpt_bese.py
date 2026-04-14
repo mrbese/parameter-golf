@@ -1173,8 +1173,8 @@ def _run_ttt_sliding_window_eval(
             window_start = pos
             while window_start < chunk_end and window_start + seq_len < total_tokens:
                 window_end = min(window_start + seq_len, total_tokens - 1)
-                x = val_tokens[window_start:window_end].unsqueeze(0).to(device)
-                y = val_tokens[window_start + 1:window_end + 1].unsqueeze(0).to(device)
+                x = val_tokens[window_start:window_end].unsqueeze(0).to(dtype=torch.int64, device=device)
+                y = val_tokens[window_start + 1:window_end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = model.forward_logits(x)
@@ -1227,8 +1227,8 @@ def _run_ttt_sliding_window_eval(
         is_last_chunk = (pos + seq_len >= total_tokens - seq_len)
         if not is_last_chunk:
             model.train()
-            x_train = val_tokens[pos:chunk_end].unsqueeze(0).to(device)
-            y_train = val_tokens[pos + 1:chunk_end + 1].unsqueeze(0).to(device)
+            x_train = val_tokens[pos:chunk_end].unsqueeze(0).to(dtype=torch.int64, device=device)
+            y_train = val_tokens[pos + 1:chunk_end + 1].unsqueeze(0).to(dtype=torch.int64, device=device)
 
             # Cosine LR decay across chunks
             total_chunks = max((total_tokens - seq_len) // seq_len, 1)
