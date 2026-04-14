@@ -366,11 +366,11 @@ def phase0_data_prep() -> None:
     t_filt = time.time()
     before = len(train_docs)
     N_WORKERS = min(mp.cpu_count(), 200)
-    chunk_size = max(1000, len(train_docs) // N_WORKERS)
-    chunks = [train_docs[i:i + chunk_size] for i in range(0, len(train_docs), chunk_size)]
+    PREP_CHUNK = 5000  # small chunks so each pickled task is ~5 MB, not ~31 MB
+    chunks = [train_docs[i:i + PREP_CHUNK] for i in range(0, len(train_docs), PREP_CHUNK)]
     log(f"  Filtering {before:,} docs across {len(chunks)} chunks with {N_WORKERS} workers...")
     with mp.Pool(N_WORKERS) as pool:
-        filtered_chunks = pool.map(_filter_chunk, chunks)
+        filtered_chunks = list(pool.imap(_filter_chunk, chunks, chunksize=1))
     train_docs = [d for chunk in filtered_chunks for d in chunk]
     log(f"  Filtered {before:,} → {len(train_docs):,} docs ({before - len(train_docs):,} removed)")
     log(f"  Filter time: {time.time() - t_filt:.1f}s")
@@ -400,11 +400,10 @@ def phase0_data_prep() -> None:
     # ------------------------------------------------------------------
     banner("Step 0.4: Curriculum sort (easy → hard) — parallel scoring")
     t_sort = time.time()
-    chunk_size = max(1000, len(train_docs) // N_WORKERS)
-    score_chunks = [train_docs[i:i + chunk_size] for i in range(0, len(train_docs), chunk_size)]
+    score_chunks = [train_docs[i:i + PREP_CHUNK] for i in range(0, len(train_docs), PREP_CHUNK)]
     log(f"  Scoring {len(train_docs):,} docs across {len(score_chunks)} chunks with {N_WORKERS} workers...")
     with mp.Pool(N_WORKERS) as pool:
-        score_results = pool.map(_score_chunk, score_chunks)
+        score_results = list(pool.imap(_score_chunk, score_chunks, chunksize=1))
     scores = [s for chunk in score_results for s in chunk]
     train_docs = [doc for _, doc in sorted(zip(scores, train_docs), key=lambda x: x[0])]
     log(f"  Sorted {len(train_docs):,} docs by difficulty ({time.time() - t_sort:.1f}s)")
@@ -421,8 +420,6 @@ def phase0_data_prep() -> None:
         SHARD_DIR.mkdir(parents=True, exist_ok=True)
         HEADER_INTS = 256
         SHARD_SIZE = 100_000_000
-
-        bpt = tok.get_bytes_per_token_lut()
 
         def write_shard(path, tokens):
             header = np.zeros(HEADER_INTS, dtype="<i4")
