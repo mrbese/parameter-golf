@@ -82,7 +82,7 @@ TRAIN_ENV = {
     "EMA_DECAY": "0.9965",
     "WARMDOWN_ITERS": "5000",
     "VE_LAYERS": "10,11",                         # v7: last 2 of 12 layers (was 11,12)
-    "EVAL_STRIDE": "64",
+    "EVAL_STRIDE": "2048",                         # v7: skip slow SW eval — TTT is the primary eval
     "TOKENIZER_PATH": str(BPE_OUTPUT),
     "DATA_PATH": str(SHARD_DIR),
     "MAX_WALLCLOCK_SECONDS": "600",
