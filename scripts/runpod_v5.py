@@ -57,8 +57,8 @@ TRAIN_ENV = {
     "NUM_KV_HEADS": "4",
     "DEPTH_RECURRENCE_START": "3",
     "DEPTH_RECURRENCE_END": "5",
-    "DEPTH_RECURRENCE_LOOPS": "2",          # v5.1: was 3, recover ~1000 steps
-    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.50",  # v5.1: was 0.35, train normally longer
+    "DEPTH_RECURRENCE_LOOPS": "3",          # v5.3: restored to 3 (v5.1's reduction to 2 caused 0.014 BPB regression)
+    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.35",  # v5.3: restored to 0.35 (v5.1's 0.50 delayed recurrence too long)
     "PARALLEL_RESIDUAL_START": "7",
     "QK_GAIN_INIT": "5.0",
     "MATRIX_LR": "0.022",
@@ -70,8 +70,10 @@ TRAIN_ENV = {
     "DATA_PATH": str(SHARD_DIR),
     "MAX_WALLCLOCK_SECONDS": "600",
     "SLOT_ENABLED": "1",
-    # v5.1: n-gram tilt disabled (table was 10.9 MB, blew 16 MB artifact limit)
-    "NGRAM_TILT_ENABLED": "0",
+    # v5.3: n-gram tilt re-enabled with max-n=3 (max-n=4 was 10.9 MB; max-n=3 fits 16 MB budget)
+    "NGRAM_TILT_ENABLED": "1",
+    "NGRAM_TILT_MAX_N": "3",
+    "NGRAM_PRIOR_PATH": str(NGRAM_TABLE),
 }
 
 SIZE_LIMIT_BYTES = 16_000_000  # 16 MB hard limit
@@ -519,7 +521,7 @@ def phase0_data_prep() -> None:
                 str(BESE_DIR / "scripts" / "build_ngram_table.py"),
                 "--shard", str(first_shard[0]),
                 "--output", str(NGRAM_TABLE),
-                "--max-n", "4",
+                "--max-n", "3",   # v5.3: max-n=3 fits budget; max-n=4 was 10.9 MB raw
                 "--top-k", "1",
             ],
             cwd=BESE_DIR,

@@ -156,6 +156,9 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
         X = X.squeeze(0)
     return X
 
+# v5.3: compile NS5 — fuses the 5-iteration bmm loop into a single CUDA kernel launch
+zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
 # --- Parallel Muon optimizer ---
 
 class Muon(torch.optim.Optimizer):
@@ -1721,7 +1724,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
 def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    # zeropower_via_newtonschulz5 runs eagerly with bmm -- do NOT compile
+    # base_model.forward is not torch.compiled (NS5 is compiled separately at module level)
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2080,10 +2083,12 @@ def main() -> None:
         # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
         optimizer_muon.step()
         zero_grad_all()
-        # EMA update
+        # EMA update — v5.3: batched foreach ops instead of Python loop (~20 free steps)
         with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+            _ema_vals = list(ema_state.values())
+            _model_vals = [t.detach().float() for t in base_model.state_dict().values()]
+            torch._foreach_mul_(_ema_vals, ema_decay)
+            torch._foreach_add_(_ema_vals, _model_vals, alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
@@ -2226,12 +2231,12 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    torch._dynamo.config.cache_size_limit = 64
-    compiled_eval = torch.compile(eval_model, dynamic=True, fullgraph=False)
+    # v5.2: run INT6 eval in eager mode — torch.compile(dynamic=True) wraps INT6
+    # scale tensors as SymFloat proxies, causing AttributeError on .size() calls
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, compiled_eval, rank, world_size, device, grad_accum_steps,
+        args, eval_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         eval_seq_len=effective_eval_seq_len,
     )
