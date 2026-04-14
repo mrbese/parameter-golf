@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-RunPod v5: End-to-end BESE submission pipeline for Parameter Golf.
+RunPod v6: End-to-end BESE submission pipeline for Parameter Golf.
 
-Targets 8xH100 pod. Runs the full v5 pipeline:
+Targets 8xH100 pod. Runs the full v6 pipeline:
   Phase 0 (untimed): BPE training, curriculum sort, data filtering + shard export, n-gram table
   Phase 1 (timed):   600s wallclock training with torchrun on 8 GPUs
   Phase 2 (timed):   Eval with n-gram tilt
   Phase 3 (untimed): Artifact assembly — quantize + compress + size check
 
+v6 changes vs v5.3:
+  - 13 layers (was 11) — uses 5 MB headroom from v5.3's 11 MB artifact
+  - PARALLEL_RESIDUAL_START=9 (was 7) — proportionally shifted for 13 layers
+  - QK_GAIN_INIT=5.25 (was 5.0) — proven monotonic improvement
+  - MATRIX_LR=0.026 (was 0.022) — optimal per dexhunter sweep
+  - VE_LAYERS=11,12 — last 2 of 13 layers
+  - Per-layer adaptive GPTQ clipping (tighter for MLP, looser for attn)
+
 Usage (on the RunPod pod):
   cd /workspace && git clone https://github.com/mrbese/parameter-golf-bese.git bese
-  cd /workspace/bese && python scripts/runpod_v5.py
+  cd /workspace/bese && python scripts/runpod_v6.py
+
+  # Resume with existing shards (rebuilds ngram table):
+  python scripts/runpod_v6.py --skip-shards
 
   # Resume after data prep:
-  python scripts/runpod_v5.py --skip-prep
+  python scripts/runpod_v6.py --skip-prep
 
   # Resume after training:
-  python scripts/runpod_v5.py --skip-prep --skip-train
+  python scripts/runpod_v6.py --skip-prep --skip-train
 """
 
 from __future__ import annotations
@@ -41,35 +52,35 @@ SP_SHARD_DIR = PG_DIR / "data/datasets/fineweb10B_sp1024"
 
 BPE_OUTPUT = BESE_DIR / "tokenizers" / "bese_bpe_248_v5.json"
 SHARD_DIR = Path("/workspace/bese_shards_v5")
-NGRAM_TABLE = BESE_DIR / "artifacts" / "ngram_table_v5.bin"
+NGRAM_TABLE = BESE_DIR / "artifacts" / "ngram_table_v6.bin"
 TRAIN_SCRIPT = BESE_DIR / "integration" / "train_gpt_bese.py"
-LOGFILE = WORK_DIR / "run_v5.log"
+LOGFILE = WORK_DIR / "run_v6.log"
 
 # ---------------------------------------------------------------------------
 # Training environment (v5 target configuration)
 # ---------------------------------------------------------------------------
 TRAIN_ENV = {
     "VOCAB_SIZE": "288",
-    "NUM_LAYERS": "11",
+    "NUM_LAYERS": "13",                          # v6: was 11 — adds 2 layers, fits budget
     "MODEL_DIM": "512",
     "MLP_MULT": "3",
     "NUM_HEADS": "8",
     "NUM_KV_HEADS": "4",
     "DEPTH_RECURRENCE_START": "3",
     "DEPTH_RECURRENCE_END": "5",
-    "DEPTH_RECURRENCE_LOOPS": "3",          # v5.3: restored to 3 (v5.1's reduction to 2 caused 0.014 BPB regression)
-    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.35",  # v5.3: restored to 0.35 (v5.1's 0.50 delayed recurrence too long)
-    "PARALLEL_RESIDUAL_START": "7",
-    "QK_GAIN_INIT": "5.0",
-    "MATRIX_LR": "0.022",
+    "DEPTH_RECURRENCE_LOOPS": "3",
+    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.35",
+    "PARALLEL_RESIDUAL_START": "9",              # v6: was 7 — last 4 of 13 layers
+    "QK_GAIN_INIT": "5.25",                      # v6: was 5.0 — proven monotonic improvement
+    "MATRIX_LR": "0.026",                        # v6: was 0.022 — optimal per dexhunter sweep
     "MUON_WD": "0.095",
     "ADAM_WD": "0.095",
     "EMA_DECAY": "0.9965",
-    "WARMDOWN_ITERS": "5000",  # ~72% of ~7000 steps (was WARMDOWN_FRAC in plan, code uses WARMDOWN_ITERS)
+    "WARMDOWN_ITERS": "5000",
+    "VE_LAYERS": "11,12",                        # v6: last 2 of 13 layers (indices 0-12)
     "TOKENIZER_PATH": str(BPE_OUTPUT),
     "DATA_PATH": str(SHARD_DIR),
     "MAX_WALLCLOCK_SECONDS": "600",
-    # v5.3: n-gram tilt re-enabled with max-n=3 (max-n=4 was 10.9 MB; max-n=3 fits 16 MB budget)
     "NGRAM_TILT_ENABLED": "1",
     "NGRAM_TILT_MAX_N": "3",
     "NGRAM_PRIOR_PATH": str(NGRAM_TABLE),
@@ -555,7 +566,7 @@ def phase1_training(num_gpus: int) -> str:
     log(f"  Shards: {len(train_shards)} train, {len(val_shards)} val")
 
     env = TRAIN_ENV.copy()
-    env["RUN_ID"] = "bese_v5"
+    env["RUN_ID"] = "bese_v6"
     env["BESE_TOKENIZER_ROOT"] = str(BESE_DIR / "tokenizer")
     env["VAL_LOSS_EVERY"] = "500"
     env["TRAIN_LOG_EVERY"] = "100"
@@ -657,7 +668,7 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
     log(f"  Log file: {LOGFILE}")
 
     # Key config summary
-    log("\n  v5 config:")
+    log("\n  v6 config:")
     log(f"    vocab_size={TRAIN_ENV['VOCAB_SIZE']}  layers={TRAIN_ENV['NUM_LAYERS']}"
         f"  dim={TRAIN_ENV['MODEL_DIM']}  mlp_mult={TRAIN_ENV['MLP_MULT']}")
     log(f"    depth_recurrence: layers {TRAIN_ENV['DEPTH_RECURRENCE_START']}-{TRAIN_ENV['DEPTH_RECURRENCE_END']}"
@@ -671,12 +682,17 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="BESE v5: Full Parameter Golf submission pipeline (8xH100)"
+        description="BESE v6: Full Parameter Golf submission pipeline (8xH100)"
     )
     parser.add_argument(
         "--skip-prep",
         action="store_true",
         help="Skip Phase 0 (data prep) if shards already exist",
+    )
+    parser.add_argument(
+        "--skip-shards",
+        action="store_true",
+        help="Skip shard prep (steps 0.1-0.5) but rebuild ngram table",
     )
     parser.add_argument(
         "--skip-train",
@@ -694,7 +710,7 @@ def main() -> None:
     _open_log()
     t_start = time.time()
 
-    banner("BESE v5 Pipeline")
+    banner("BESE v6 Pipeline")
     log(f"  Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  Working directory: {BESE_DIR}")
     log(f"  Log file: {LOGFILE}")
@@ -727,8 +743,24 @@ def main() -> None:
             )
         log(f"  Found tokenizer: {BPE_OUTPUT}")
         log(f"  Found {len(train_shards)} training shards in {SHARD_DIR}")
-        # Always rebuild ngram table even under --skip-prep: the existing table may
-        # have been built with a different max-n (e.g. v5 used max-n=4, v5.3 uses max-n=3)
+        # Always rebuild ngram table even under --skip-prep: v6 uses a new path
+        _build_ngram_table()
+    elif args.skip_shards:
+        log("\n  --skip-shards: Skipping shard prep (steps 0.1-0.5), rebuilding ngram table")
+        # Verify shards exist from a prior run (e.g. v5)
+        if not BPE_OUTPUT.exists():
+            raise FileNotFoundError(
+                f"--skip-shards requires tokenizer at {BPE_OUTPUT}. "
+                "Run without --skip-shards first."
+            )
+        train_shards = list(SHARD_DIR.glob("fineweb_train_*.bin"))
+        if not train_shards:
+            raise FileNotFoundError(
+                f"--skip-shards requires training shards in {SHARD_DIR}. "
+                "Run without --skip-shards first."
+            )
+        log(f"  Found tokenizer: {BPE_OUTPUT}")
+        log(f"  Found {len(train_shards)} training shards in {SHARD_DIR}")
         _build_ngram_table()
     else:
         phase0_data_prep()

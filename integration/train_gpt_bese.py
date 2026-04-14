@@ -1126,11 +1126,13 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
-def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+def quantize_int6_per_row(t: Tensor, clip_range: int = 31, clip_percentiles: list[float] | None = None) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    if clip_percentiles is None:
+        clip_percentiles = [0.9990, 0.9995, 0.9999, 0.99999, 1.0]
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+        for pct in clip_percentiles:
             if pct < 1.0:
                 row_clip = torch.quantile(t32.abs(), pct, dim=1)
             else:
@@ -1233,7 +1235,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
+            # v6: per-layer adaptive GPTQ clipping
+            # MLP layers: tighter clipping preserves precision
+            # Attn layers: looser clipping improves compressibility
+            if cat == "mlp":
+                q, s = quantize_int6_per_row(t, clip_range=31, clip_percentiles=[0.9995, 0.9999, 1.0])
+            else:  # attn
+                q, s = quantize_int6_per_row(t, clip_range=31, clip_percentiles=[0.999, 0.9995, 0.9999, 0.99999, 1.0])
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
