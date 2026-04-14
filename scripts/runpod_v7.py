@@ -440,6 +440,14 @@ def phase0_data_prep() -> None:
         banner("Step 0.3: Train BESE BPE (1024 merges)")
         from bese_fast_bpe import train_bpe_merges_fast, FastBESEBPETokenizer
 
+        # Free encode workers before BPE — the linked list needs ~40-60 GB and
+        # 224 pre-spawned workers occupy ~16 GB.  We recreate the pool after BPE.
+        log("  Releasing encode pool to free RAM for BPE linked list...")
+        encode_pool.terminate()
+        encode_pool.join()
+        del encode_pool
+        import gc; gc.collect()
+
         t_bpe = time.time()
         # Extract just the text from scored_train for BPE training (100K docs for deeper merges)
         bpe_sample = [doc for _, doc in scored_train[:100000]]
@@ -451,6 +459,13 @@ def phase0_data_prep() -> None:
         BPE_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         tok.save(BPE_OUTPUT)
         log(f"  Saved tokenizer to {BPE_OUTPUT} ({time.time() - t_bpe:.1f}s)")
+
+        # Recreate encode workers now that BPE is done.
+        # Workers fork after the corpus is loaded — PTEs are ~120 MB each at 60 GB RSS,
+        # but COW means only written pages are physically copied (encode workers only write
+        # their own output arrays, not the corpus), so the overhead is acceptable.
+        log(f"  Re-spawning {ENCODE_WORKERS} encode workers...")
+        encode_pool = mp.Pool(ENCODE_WORKERS)
 
     # ------------------------------------------------------------------
     # Step 0.4 — Curriculum sort (scores pre-computed in workers)
