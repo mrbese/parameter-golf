@@ -38,6 +38,23 @@ SHARD_VERSION = 1
 HEADER_INTS = 256
 
 
+def is_high_value(text: str) -> bool:
+    """Filter out web boilerplate and low-information docs."""
+    words = text.split()
+    if len(words) < 50:
+        return False
+    if len(set(words)) / len(words) < 0.25:
+        return False
+    lowered = text.lower()
+    boilerplate_markers = [
+        'cookie', 'subscribe', 'click here', 'privacy policy',
+        'all rights reserved', 'terms of service', 'sign up',
+    ]
+    if sum(1 for m in boilerplate_markers if m in lowered) >= 3:
+        return False
+    return True
+
+
 def write_shard(path: Path, tokens: np.ndarray) -> None:
     """Write uint16 tokens with fixed header."""
     if tokens.dtype != np.uint16:
@@ -81,6 +98,7 @@ def main() -> None:
     ap.add_argument("--val-docs", type=int, default=50_000, help="First N docs for validation (default 50k)")
     ap.add_argument("--train-prefix", type=str, default="fineweb_train_")
     ap.add_argument("--val-prefix", type=str, default="fineweb_val_")
+    ap.add_argument("--filter", action="store_true", help="Apply is_high_value() quality filter")
     args = ap.parse_args()
 
     tok = FastBESEBPETokenizer.load(str(args.tokenizer))
@@ -93,8 +111,12 @@ def main() -> None:
     val_n = args.val_docs
     val_texts: list[str] = []
     doc_iter = iter_docs(args.input)
+    skipped_filter = 0
 
     for text in doc_iter:
+        if args.filter and not is_high_value(text):
+            skipped_filter += 1
+            continue
         val_texts.append(text)
         if len(val_texts) >= val_n:
             break
@@ -147,6 +169,9 @@ def main() -> None:
         current_count = 0
 
     for text in train_iter:
+        if args.filter and not is_high_value(text):
+            skipped_filter += 1
+            continue
         arr = encode_doc(tok, text, bpt)
         current.append(arr)
         current_count += arr.shape[0]
@@ -156,6 +181,8 @@ def main() -> None:
 
     flush_train()
     print(f"Processed {train_doc_count} training docs.")
+    if args.filter:
+        print(f"Filtered out {skipped_filter} low-quality docs.")
 
     manifest = {
         "tokenizer_name": args.tokenizer.stem,

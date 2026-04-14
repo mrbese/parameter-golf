@@ -48,7 +48,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -62,7 +62,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.022))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -81,8 +81,8 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
-    muon_wd = float(os.environ.get("MUON_WD", 0.04))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
+    muon_wd = float(os.environ.get("MUON_WD", 0.095))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.095))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -114,6 +114,24 @@ class Hyperparameters:
     slot_lr = float(os.environ.get("SLOT_LR", 0.1))
     slot_lbfgs_max_iter = int(os.environ.get("SLOT_LBFGS_MAX_ITER", 5))
     slot_lbfgs_history = int(os.environ.get("SLOT_LBFGS_HISTORY", 10))
+
+    # v5: N-gram tilt at eval time
+    ngram_tilt_enabled = bool(int(os.environ.get("NGRAM_TILT_ENABLED", "0")))
+    ngram_tilt_beta = float(os.environ.get("NGRAM_TILT_BETA", 0.3))
+    ngram_tilt_max_n = int(os.environ.get("NGRAM_TILT_MAX_N", 4))
+    ngram_prior_path = os.environ.get("NGRAM_PRIOR_PATH", "")
+
+    # v5: Depth recurrence (loop middle layers multiple times)
+    depth_recurrence_start = int(os.environ.get("DEPTH_RECURRENCE_START", 3))
+    depth_recurrence_end = int(os.environ.get("DEPTH_RECURRENCE_END", 5))  # inclusive
+    depth_recurrence_loops = int(os.environ.get("DEPTH_RECURRENCE_LOOPS", 1))  # 1 = no recurrence
+    depth_recurrence_activation_frac = float(os.environ.get("DEPTH_RECURRENCE_ACTIVATION_FRAC", 0.35))
+
+    # v5: Parallel residuals (GPT-J style, attn + mlp in parallel for late layers)
+    parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 999))  # 999 = disabled
+
+    # v5: EMA decay (was hardcoded to 0.997)
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -373,6 +391,71 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+# --- N-gram tilt for eval-time logit boosting ---
+
+class NgramTilt:
+    """Causal n-gram prediction booster for eval time.
+
+    Builds a live n-gram table from ground-truth tokens seen so far (causal),
+    and optionally loads a pre-computed prior from training data.
+    Applies a small additive tilt to logits based on n-gram predictions.
+    """
+
+    def __init__(self, vocab_size: int, beta: float = 0.3, max_n: int = 4):
+        self.vocab_size = vocab_size
+        self.beta = beta
+        self.max_n = max_n
+        self.live_table: dict[int, dict[tuple, dict[int, int]]] = {
+            n: {} for n in range(2, max_n + 1)
+        }
+        self.prior_table: dict | None = None
+
+    def load_prior(self, path: str) -> None:
+        """Load pre-computed n-gram table from compressed artifact."""
+        import pickle
+        import zlib
+        with open(path, 'rb') as f:
+            compressed = f.read()
+        self.prior_table = pickle.loads(zlib.decompress(compressed))
+
+    def update(self, context_ids: list[int], new_token: int) -> None:
+        """Update live table with ground truth (causal — uses prefix only)."""
+        for n in range(2, self.max_n + 1):
+            if len(context_ids) >= n - 1:
+                prefix = tuple(context_ids[-(n - 1):])
+                if prefix not in self.live_table[n]:
+                    self.live_table[n][prefix] = {}
+                counts = self.live_table[n][prefix]
+                counts[new_token] = counts.get(new_token, 0) + 1
+
+    def tilt_logits(self, logits: Tensor, context_ids: list[int]) -> Tensor:
+        """Apply n-gram hint tilt to logits. logits shape: [vocab_size]."""
+        hint = torch.zeros_like(logits)
+        for n in range(2, self.max_n + 1):
+            if len(context_ids) >= n - 1:
+                prefix = tuple(context_ids[-(n - 1):])
+                # Check live table first (more recent)
+                if prefix in self.live_table[n]:
+                    counts = self.live_table[n][prefix]
+                    if counts:
+                        best = max(counts, key=counts.get)
+                        hint[best] += 1.0
+                elif self.prior_table and n in self.prior_table and prefix in self.prior_table[n]:
+                    top = self.prior_table[n][prefix]
+                    if top:
+                        best_token = top[0][0]  # top-k=1 format: [(token, count)]
+                        hint[best_token] += 0.5
+        return logits + self.beta * hint
+
+    def tilt_logits_batch(self, logits: Tensor, all_context_ids: list[list[int]]) -> Tensor:
+        """Apply n-gram tilt to batched logits. logits shape: [batch, seq, vocab]."""
+        for b in range(logits.shape[0]):
+            for t in range(logits.shape[1]):
+                if len(all_context_ids[b]) > 0:
+                    logits[b, t] = self.tilt_logits(logits[b, t], all_context_ids[b][:t + 1])
+        return logits
+
 
 # --- Quantization helpers ---
 
@@ -759,8 +842,10 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        parallel_residual: bool = False,
     ):
         super().__init__()
+        self.parallel_residual = parallel_residual
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -779,9 +864,15 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        normed = self.attn_norm(x_in) * self.ln_scale_factor
+        attn_out, raw_v = self.attn(normed, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        if self.parallel_residual:
+            # GPT-J style: attn and MLP both see the same normed input
+            mlp_out = self.mlp(normed, up_w, down_w)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
+        else:
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -814,6 +905,11 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        parallel_residual_start: int = 999,
+        depth_recurrence_start: int = 3,
+        depth_recurrence_end: int = 5,
+        depth_recurrence_loops: int = 1,
+        depth_recurrence_activation_frac: float = 0.35,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -825,6 +921,17 @@ class GPT(nn.Module):
         self.value_residual = value_residual
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
+        # v5: depth recurrence
+        self.depth_recurrence_start = depth_recurrence_start
+        self.depth_recurrence_end = depth_recurrence_end
+        self.depth_recurrence_loops = depth_recurrence_loops
+        self.depth_recurrence_activation_frac = depth_recurrence_activation_frac
+        self._training_progress = 0.0  # set by training loop
+        # _rec_loops: controls how many times the recurrence zone runs.
+        # Starts at 1 (no recurrence); training loop sets to depth_recurrence_loops
+        # once _training_progress crosses the activation threshold.
+        # This avoids torch.compile recompilation every step — it only changes once.
+        self._rec_loops = 1
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -855,6 +962,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    parallel_residual=(i >= parallel_residual_start),
                 )
                 for i in range(num_layers)
             ]
@@ -920,35 +1028,78 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _run_layers(self, x: Tensor, x0: Tensor, input_ids: Tensor, ve_cache: dict) -> Tensor:
+        """Run all layers with U-Net skips and optional depth recurrence."""
         n = self.num_layers
+        rec_start = self.depth_recurrence_start
+        rec_end = min(self.depth_recurrence_end, n - 1)
+        rec_loops = self._rec_loops  # Set externally by training loop; avoids recompilation
+
+        v0 = None
+        skips: list[Tensor] = []
+
+        def run_block(i: int, x: Tensor, v0: Tensor | None) -> tuple[Tensor, Tensor | None]:
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x_out, raw_v = self.blocks[i](x, x0,
+                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                v_embed=ve, v0=v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
+            return x_out, v0
+
+        # Section 1: Pre-recurrence layers
+        for i in range(min(rec_start, n)):
+            if i < self.num_encoder_layers:
+                x, v0 = run_block(i, x, v0)
+                skips.append(x)
+            else:
+                di = i - self.num_encoder_layers
+                if skips and di < self.num_skip_weights:
+                    x = x + self.skip_weights[di].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x, v0 = run_block(i, x, v0)
+
+        # Section 2: Recurrence zone — run [rec_start..rec_end] rec_loops times
+        # First pass: push/pop skips as normal
+        # Additional passes: no skip operations
+        for loop_pass in range(rec_loops):
+            for i in range(rec_start, min(rec_end + 1, n)):
+                if loop_pass == 0:
+                    # First pass: handle skips normally
+                    if i < self.num_encoder_layers:
+                        x, v0 = run_block(i, x, v0)
+                        skips.append(x)
+                    else:
+                        di = i - self.num_encoder_layers
+                        if skips and di < self.num_skip_weights:
+                            x = x + self.skip_weights[di].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                        x, v0 = run_block(i, x, v0)
+                else:
+                    # Additional passes: no skip operations
+                    x, v0 = run_block(i, x, v0)
+
+        # Section 3: Post-recurrence layers
+        for i in range(min(rec_end + 1, n), n):
+            if i < self.num_encoder_layers:
+                x, v0 = run_block(i, x, v0)
+                skips.append(x)
+            else:
+                di = i - self.num_encoder_layers
+                if skips and di < self.num_skip_weights:
+                    x = x + self.skip_weights[di].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x, v0 = run_block(i, x, v0)
+
+        return x
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        v0 = None
-        skips: list[Tensor] = []
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
-            if v0 is None and raw_v is not None:
-                v0 = raw_v
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+        x = self._run_layers(x, x0, input_ids, ve_cache)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -979,34 +1130,14 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        v0 = None
-        skips: list[Tensor] = []
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
-            if v0 is None and raw_v is not None:
-                v0 = raw_v
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+        x = self._run_layers(x, x0, input_ids, ve_cache)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1015,34 +1146,14 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
     def forward_hidden(self, input_ids: Tensor) -> Tensor:
         """Return final hidden states (before projection). Used by SLOT eval."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        v0 = None
-        skips: list[Tensor] = []
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
-            if v0 is None and raw_v is not None:
-                v0 = raw_v
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+        x = self._run_layers(x, x0, input_ids, ve_cache)
         return self.final_norm(x)
 
 # --- Sliding window evaluation ---
@@ -1309,6 +1420,17 @@ def eval_val_slot(
 
     vocab_size, model_dim = proj_w.shape
 
+    # v5: N-gram tilt initialization
+    ngram_tilt: NgramTilt | None = None
+    if args.ngram_tilt_enabled:
+        ngram_tilt = NgramTilt(vocab_size, beta=args.ngram_tilt_beta, max_n=args.ngram_tilt_max_n)
+        if args.ngram_prior_path:
+            import os as _os
+            if _os.path.exists(args.ngram_prior_path):
+                ngram_tilt.load_prior(args.ngram_prior_path)
+                log_fn = print if rank == 0 else lambda *a, **k: None
+                log_fn(f"  ngram_tilt: loaded prior from {args.ngram_prior_path}")
+
     compiled_hidden = torch.compile(base_model.forward_hidden, fullgraph=False, mode="reduce-overhead")
 
     total_tokens = val_tokens.numel() - 1
@@ -1369,12 +1491,31 @@ def eval_val_slot(
             line_search_fn="strong_wolfe",
         )
 
+        # v5: Pre-convert inputs to CPU lists once for n-gram tilt (avoid per-token GPU sync)
+        input_lists: list[list[int]] | None = None
+        if ngram_tilt is not None:
+            input_lists = [inputs[i, :wlens[i]].cpu().tolist() for i in range(bsz)]
+
+        # v5: Build a static tilt tensor before L-BFGS so it's applied consistently
+        # during both optimization and final scoring
+        tilt_tensor: Tensor | None = None
+        if ngram_tilt is not None and input_lists is not None:
+            tilt_tensor = torch.zeros(bsz, seq_len, vocab_size, device=device, dtype=torch.float32)
+            for i in range(bsz):
+                for t in range(wlens[i]):
+                    ctx = input_lists[i][:t + 1]
+                    hint = torch.zeros(vocab_size, device=device)
+                    tilt_tensor[i, t] = ngram_tilt.tilt_logits(hint, ctx)
+
         for _ in range(args.slot_steps):
             def closure():
                 optimizer.zero_grad()
                 h = hidden_f + delta
                 lp = F.linear(h, proj_w) + logit_bias
                 lp = softcap * torch.tanh(lp / softcap)
+                # v5: Apply tilt inside closure so L-BFGS optimizes tilted logits
+                if tilt_tensor is not None:
+                    lp = lp + tilt_tensor
                 per_token = F.cross_entropy(lp.reshape(-1, vocab_size), targets.reshape(-1), reduction="none").reshape(bsz, seq_len)
                 loss = (per_token * mask).sum() / mask.sum().clamp_min(1.0)
                 loss.backward()
@@ -1385,6 +1526,8 @@ def eval_val_slot(
             h = hidden_f + delta
             lp = F.linear(h, proj_w) + logit_bias
             lp = softcap * torch.tanh(lp / softcap)
+            if tilt_tensor is not None:
+                lp = lp + tilt_tensor
             per_token = F.cross_entropy(lp.reshape(-1, vocab_size), targets.reshape(-1), reduction="none").reshape(bsz, seq_len)
             for i in range(bsz):
                 s = score_starts[i]
@@ -1397,6 +1540,12 @@ def eval_val_slot(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+                # v5: Update n-gram tilt with ground truth tokens (causal)
+                if ngram_tilt is not None and input_lists is not None:
+                    target_list = targets[i, s:wlen].cpu().tolist()
+                    for t_idx, t_val in enumerate(target_list):
+                        ctx = input_lists[i][:s + t_idx + 1]
+                        ngram_tilt.update(ctx, t_val)
 
         if rank == 0 and (batch_idx % (batch_seqs * 10) == 0):
             elapsed = time.perf_counter() - t_start
@@ -1685,6 +1834,11 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        parallel_residual_start=args.parallel_residual_start,
+        depth_recurrence_start=args.depth_recurrence_start,
+        depth_recurrence_end=args.depth_recurrence_end,
+        depth_recurrence_loops=args.depth_recurrence_loops,
+        depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1840,8 +1994,9 @@ def main() -> None:
     from collections import deque
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
+    ema_decay = args.ema_decay
     training_time_ms = 0.0
+    approx_training_time_ms = 0.0  # v5: init before training loop (used for recurrence activation)
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1883,6 +2038,16 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
+        # v5: update training progress for depth recurrence activation
+        # Use wallclock fraction (not step fraction) since training is wallclock-capped
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            base_model._training_progress = approx_training_time_ms / max_wallclock_ms
+        else:
+            base_model._training_progress = step / max(args.iterations, 1)
+        # Activate recurrence once threshold is crossed (changes _rec_loops once, one recompile)
+        if base_model._rec_loops == 1 and args.depth_recurrence_loops > 1 and base_model._training_progress >= args.depth_recurrence_activation_frac:
+            base_model._rec_loops = args.depth_recurrence_loops
+            log0(f"depth_recurrence:activated step:{step} progress:{base_model._training_progress:.3f} loops:{args.depth_recurrence_loops}")
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -2028,7 +2193,14 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        parallel_residual_start=args.parallel_residual_start,
+        depth_recurrence_start=args.depth_recurrence_start,
+        depth_recurrence_end=args.depth_recurrence_end,
+        depth_recurrence_loops=args.depth_recurrence_loops,
+        depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
     ).to(device).bfloat16()
+    eval_model._training_progress = 1.0  # v5: enable depth recurrence in eval
+    eval_model._rec_loops = args.depth_recurrence_loops
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
     eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
