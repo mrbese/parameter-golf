@@ -413,6 +413,9 @@ class NgramTilt:
             n: {} for n in range(2, max_n + 1)
         }
         self.prior_table: dict | None = None
+        # Dense lookup tensors for vectorized tilt (populated by load_prior)
+        self.bigram_arr: "Tensor | None" = None   # shape [V]
+        self.trigram_arr: "Tensor | None" = None  # shape [V, V]
 
     def load_prior(self, path: str) -> None:
         """Load pre-computed n-gram table from compressed artifact."""
@@ -421,6 +424,30 @@ class NgramTilt:
         with open(path, 'rb') as f:
             compressed = f.read()
         self.prior_table = pickle.loads(zlib.decompress(compressed))
+        self._precompute_lookup_arrays()
+
+    def _precompute_lookup_arrays(self) -> None:
+        """Convert prior_table dicts into dense int16 tensors for vectorized eval.
+
+        bigram_arr[prev] = top-1 token for bigram prefix (prev,), or -1.
+        trigram_arr[prev2, prev1] = top-1 token for trigram prefix (prev2, prev1), or -1.
+        Lookup is O(1) tensor indexing instead of O(N) Python dict iteration.
+        """
+        if self.prior_table is None:
+            return
+        V = self.vocab_size
+        if 2 in self.prior_table:
+            arr = torch.full((V,), -1, dtype=torch.int16)
+            for (prev,), top_list in self.prior_table[2].items():
+                if top_list:
+                    arr[prev] = top_list[0][0]
+            self.bigram_arr = arr
+        if 3 in self.prior_table:
+            arr = torch.full((V, V), -1, dtype=torch.int16)
+            for (prev2, prev1), top_list in self.prior_table[3].items():
+                if top_list:
+                    arr[prev2, prev1] = top_list[0][0]
+            self.trigram_arr = arr
 
     def update(self, context_ids: list[int], new_token: int) -> None:
         """Update live table with ground truth (causal — uses prefix only)."""
@@ -1206,21 +1233,25 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
-            # v5.3: apply n-gram prior tilt before scoring
+            # v5.3: apply n-gram prior tilt before scoring (vectorized via precomputed arrays)
             if ngram_tilt is not None and ngram_tilt.prior_table is not None:
                 logits_f = logits.float()
-                prior = ngram_tilt.prior_table
-                beta = ngram_tilt.beta
-                for i in range(bsz):
-                    ctx = x_batch[i, :wlens[i]].tolist()
-                    for t in range(wlens[i]):
-                        for n in range(2, ngram_tilt.max_n + 1):
-                            if t >= n - 1:
-                                prefix = tuple(ctx[t - n + 1:t])
-                                if n in prior and prefix in prior[n]:
-                                    top = prior[n][prefix]
-                                    if top:
-                                        logits_f[i, t, top[0][0]] += beta * 0.5
+                delta = ngram_tilt.beta * 0.5
+                dev = logits.device
+                # Bigram: x[:, t-1] → top token → boost logits[:, t, top]
+                if ngram_tilt.bigram_arr is not None:
+                    bg = ngram_tilt.bigram_arr.to(dev)
+                    top_tok = bg[x_batch[:, :-1].long()]  # [bsz, seq_len-1]
+                    b_idx, t_idx = (top_tok >= 0).nonzero(as_tuple=True)
+                    if b_idx.numel() > 0:
+                        logits_f[b_idx, t_idx + 1, top_tok[b_idx, t_idx].long()] += delta
+                # Trigram: (x[:, t-2], x[:, t-1]) → top token → boost logits[:, t, top]
+                if ngram_tilt.trigram_arr is not None:
+                    tg = ngram_tilt.trigram_arr.to(dev)
+                    top_tok = tg[x_batch[:, :-2].long(), x_batch[:, 1:-1].long()]  # [bsz, seq_len-2]
+                    b_idx, t_idx = (top_tok >= 0).nonzero(as_tuple=True)
+                    if b_idx.numel() > 0:
+                        logits_f[b_idx, t_idx + 2, top_tok[b_idx, t_idx].long()] += delta
                 logits = logits_f
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
