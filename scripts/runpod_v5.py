@@ -5,7 +5,7 @@ RunPod v5: End-to-end BESE submission pipeline for Parameter Golf.
 Targets 8xH100 pod. Runs the full v5 pipeline:
   Phase 0 (untimed): BPE training, curriculum sort, data filtering + shard export, n-gram table
   Phase 1 (timed):   600s wallclock training with torchrun on 8 GPUs
-  Phase 2 (timed):   Eval with SLOT + n-gram tilt
+  Phase 2 (timed):   Eval with n-gram tilt
   Phase 3 (untimed): Artifact assembly — quantize + compress + size check
 
 Usage (on the RunPod pod):
@@ -192,7 +192,6 @@ def extract_metrics(output: str) -> dict:
             for part in line.split():
                 if part.startswith("val_bpb:"):
                     metrics["int6_bpb"] = float(part.split(":")[1])
-        # SLOT
         # Submission size
         if "Total submission size" in line and "bytes" in line:
             m = re.search(r"(\d+)\s*bytes", line)
@@ -580,16 +579,15 @@ def phase1_training(num_gpus: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Evaluation (timed, with SLOT + n-gram tilt)
+# Phase 2: Evaluation (timed, with n-gram tilt)
 # ---------------------------------------------------------------------------
 def phase2_eval(train_output: str) -> dict:
     """Extract eval metrics from the training output.
 
-    In the current pipeline, eval runs inline at the end of training
-    (the training script handles SLOT and eval itself when SLOT_ENABLED=1).
+    In the current pipeline, eval runs inline at the end of training.
     If a separate eval pass is needed in the future, add it here.
     """
-    banner("PHASE 2: EVALUATION (SLOT + n-gram tilt)")
+    banner("PHASE 2: EVALUATION (n-gram tilt)")
 
     metrics = extract_metrics(train_output)
 
@@ -668,7 +666,6 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
         f" x{TRAIN_ENV['DEPTH_RECURRENCE_LOOPS']} loops"
         f" (active after {float(TRAIN_ENV['DEPTH_RECURRENCE_ACTIVATION_FRAC']) * 100:.0f}% of training)")
     log(f"    parallel_residual: start={TRAIN_ENV['PARALLEL_RESIDUAL_START']}")
-    log(f"    slot_enabled={TRAIN_ENV['SLOT_ENABLED']}")
 
 
 # ---------------------------------------------------------------------------
