@@ -94,6 +94,13 @@ class Hyperparameters:
     ngram_tilt_max_n = int(os.environ.get("NGRAM_TILT_MAX_N", 4))
     ngram_prior_path = os.environ.get("NGRAM_PRIOR_PATH", "")
 
+    # v6.1: Legal TTT (test-time training) at eval
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.005))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+
     # v5: Depth recurrence (loop middle layers multiple times)
     depth_recurrence_start = int(os.environ.get("DEPTH_RECURRENCE_START", 3))
     depth_recurrence_end = int(os.environ.get("DEPTH_RECURRENCE_END", 5))  # inclusive
@@ -1115,6 +1122,143 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+# --- Legal TTT (test-time training) sliding window evaluation ---
+
+def _run_ttt_sliding_window_eval(
+    model: GPT,
+    val_tokens: Tensor,
+    seq_len: int,
+    stride: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    device: torch.device,
+    ttt_lr: float = 0.005,
+    ttt_momentum: float = 0.9,
+    ttt_epochs: int = 3,
+    ttt_grad_clip: float = 1.0,
+    ngram_tilt: "NgramTilt | None" = None,
+) -> tuple[float, float]:
+    """
+    Legal TTT sliding window evaluation.
+
+    Protocol (score-first):
+      1. Score chunk N under inference_mode (no gradients, no weight mutation)
+      2. Train on chunk N's tokens for ttt_epochs with SGD
+      3. Move to chunk N+1
+
+    Every token is scored BEFORE any gradient update uses that token.
+    The model improves over evaluation by learning from already-scored tokens.
+    """
+    model.eval()
+    original_state = copy.deepcopy(model.state_dict())
+
+    ttt_optimizer = torch.optim.SGD(
+        model.parameters(), lr=ttt_lr, momentum=ttt_momentum
+    )
+
+    total_tokens = val_tokens.shape[0]
+    loss_sum = 0.0
+    token_count = 0
+    byte_count = 0.0
+
+    pos = 0
+    chunk_idx = 0
+
+    while pos + seq_len < total_tokens:
+        chunk_end = min(pos + seq_len, total_tokens - 1)
+
+        # === PHASE 1: SCORE (inference_mode — no weight mutation possible) ===
+        with torch.inference_mode():
+            window_start = pos
+            while window_start < chunk_end and window_start + seq_len < total_tokens:
+                window_end = min(window_start + seq_len, total_tokens - 1)
+                x = val_tokens[window_start:window_end].unsqueeze(0).to(device)
+                y = val_tokens[window_start + 1:window_end + 1].unsqueeze(0).to(device)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model.forward_logits(x)
+
+                # Apply n-gram tilt (same logic as eval_val_sliding)
+                if ngram_tilt is not None and ngram_tilt.prior_table is not None:
+                    logits_f = logits.float()
+                    delta = ngram_tilt.beta * 0.5
+                    dev = logits.device
+                    if ngram_tilt.bigram_arr is not None:
+                        bg = ngram_tilt.bigram_arr.to(dev)
+                        top_tok = bg[x[:, :-1].long()]
+                        b_idx, t_idx = (top_tok >= 0).nonzero(as_tuple=True)
+                        if b_idx.numel() > 0:
+                            logits_f[b_idx, t_idx + 1, top_tok[b_idx, t_idx].long()] += delta
+                    if ngram_tilt.trigram_arr is not None:
+                        tg = ngram_tilt.trigram_arr.to(dev)
+                        top_tok = tg[x[:, :-2].long(), x[:, 1:-1].long()]
+                        b_idx, t_idx = (top_tok >= 0).nonzero(as_tuple=True)
+                        if b_idx.numel() > 0:
+                            logits_f[b_idx, t_idx + 2, top_tok[b_idx, t_idx].long()] += delta
+                    logits = logits_f
+
+                # Score tokens: first window gets all, subsequent get last stride
+                wlen = window_end - window_start
+                if window_start == pos:
+                    s = 0
+                else:
+                    s = max(wlen - stride, 0)
+
+                nll = F.cross_entropy(
+                    logits[0, s:wlen].float(),
+                    y[0, s:wlen],
+                    reduction="none",
+                )
+                loss_sum += nll.to(torch.float64).sum().item()
+                token_count += (wlen - s)
+
+                tgt = y[0, s:wlen]
+                prev = x[0, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum().item()
+
+                window_start += stride
+                if window_start >= chunk_end:
+                    break
+
+        # === PHASE 2: TRAIN on already-scored chunk (gradient updates OK) ===
+        is_last_chunk = (pos + seq_len >= total_tokens - seq_len)
+        if not is_last_chunk:
+            model.train()
+            x_train = val_tokens[pos:chunk_end].unsqueeze(0).to(device)
+            y_train = val_tokens[pos + 1:chunk_end + 1].unsqueeze(0).to(device)
+
+            # Cosine LR decay across chunks
+            total_chunks = max((total_tokens - seq_len) // seq_len, 1)
+            cos_scale = 0.5 * (1.0 + math.cos(math.pi * chunk_idx / total_chunks))
+            for pg in ttt_optimizer.param_groups:
+                pg['lr'] = ttt_lr * cos_scale
+
+            for epoch in range(ttt_epochs):
+                ttt_optimizer.zero_grad()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x_train, y_train)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), ttt_grad_clip)
+                ttt_optimizer.step()
+
+            model.eval()
+
+        pos += seq_len
+        chunk_idx += 1
+
+    # Restore original weights (TTT is eval-only, don't persist changes)
+    model.load_state_dict(original_state)
+
+    if token_count == 0:
+        return 0.0, 0.0
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count / max(byte_count, 1e-9)
+    return val_loss, bits_per_token * tokens_per_byte
+
 
 # --- GPTQ-lite int6 quantization ---
 
@@ -1733,7 +1877,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(save_dict, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=6)
+    quant_blob = lzma.compress(quant_raw, preset=9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1849,6 +1993,32 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int6_lzma_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    # === Legal TTT eval (if enabled) ===
+    if args.ttt_enabled:
+        log0("ttt_eval:starting")
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = _run_ttt_sliding_window_eval(
+            model=eval_model,
+            val_tokens=val_tokens,
+            seq_len=sw_seq_len,
+            stride=args.eval_stride,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            device=device,
+            ttt_lr=args.ttt_lr,
+            ttt_momentum=args.ttt_momentum,
+            ttt_epochs=args.ttt_epochs,
+            ttt_grad_clip=args.ttt_grad_clip,
+            ngram_tilt=_sw_ngram_tilt,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt_sliding_window val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_ttt_sliding_window_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
