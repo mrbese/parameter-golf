@@ -2160,8 +2160,15 @@ def main() -> None:
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
+    save_dict = {"w": quant_result, "m": quant_meta}
+    # Bundle n-gram prior table if it exists
+    ngram_path = os.environ.get("NGRAM_PRIOR_PATH", "")
+    if ngram_path and os.path.exists(ngram_path):
+        with open(ngram_path, "rb") as nf:
+            save_dict["ngram"] = nf.read()
+        log0(f"Bundled n-gram prior: {len(save_dict['ngram']):,} bytes from {ngram_path}")
     quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    torch.save(save_dict, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = lzma.compress(quant_raw, preset=6)
     if master_process:
@@ -2179,6 +2186,15 @@ def main() -> None:
         io.BytesIO(lzma.decompress(quant_blob_disk)),
         map_location="cpu",
     )
+    # Extract bundled n-gram prior to temp file for NgramTilt.load_prior()
+    if "ngram" in quant_state:
+        import tempfile
+        _ngram_tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+        _ngram_tmp.write(quant_state["ngram"])
+        _ngram_tmp.close()
+        os.environ["NGRAM_PRIOR_PATH"] = _ngram_tmp.name
+        log0(f"Extracted bundled n-gram prior: {len(quant_state['ngram']):,} bytes → {_ngram_tmp.name}")
+        del quant_state["ngram"]
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)

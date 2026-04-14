@@ -34,10 +34,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 BESE_DIR = Path(os.environ.get("BESE_DIR", "/workspace/bese"))
 WORK_DIR = Path("/workspace")
+PG_DIR = Path(os.environ.get("PG_DIR", "/workspace/parameter-golf"))
 
-BPE_INPUT = WORK_DIR / "decoded_docs_jsonl" / "fineweb_train_all.jsonl"
+SP_MODEL = PG_DIR / "data/tokenizers/fineweb_1024_bpe.model"
+SP_SHARD_DIR = PG_DIR / "data/datasets/fineweb10B_sp1024"
+
 BPE_OUTPUT = BESE_DIR / "tokenizers" / "bese_bpe_248_v5.json"
-CURRICULUM_OUTPUT = WORK_DIR / "decoded_docs_jsonl" / "fineweb_train_curriculum.jsonl"
 SHARD_DIR = Path("/workspace/bese_shards_v5")
 NGRAM_TABLE = BESE_DIR / "artifacts" / "ngram_table_v5.bin"
 TRAIN_SCRIPT = BESE_DIR / "integration" / "train_gpt_bese.py"
@@ -224,82 +226,234 @@ def extract_metrics(output: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 0: Data Preparation (untimed)
+# SP shard decode worker (reused from v3)
+# ---------------------------------------------------------------------------
+def _decode_shard(args):
+    """Decode a single SP shard — runs in a worker process."""
+    shard_file, sp_model_path, min_len = args
+    import sentencepiece as spm
+    import numpy as np
+    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
+    bos = sp.bos_id()
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    header = np.fromfile(shard_file, dtype="<i4", count=256)
+    n = int(header[2])
+    tokens = np.fromfile(shard_file, dtype="<u2", count=n, offset=header_bytes)
+    docs = []
+    current = []
+    for t in tokens:
+        if t == bos:
+            if current:
+                text = sp.decode(current)
+                if len(text.strip()) > min_len:
+                    docs.append(text)
+            current = []
+        else:
+            current.append(int(t))
+    if current:
+        text = sp.decode(current)
+        if len(text.strip()) > min_len:
+            docs.append(text)
+    return str(shard_file.name), n, docs
+
+
+def _is_high_value(text: str) -> bool:
+    """Filter out web boilerplate and low-information docs."""
+    words = text.split()
+    if len(words) < 50:
+        return False
+    if len(set(words)) / len(words) < 0.25:
+        return False
+    lowered = text.lower()
+    boilerplate_markers = [
+        'cookie', 'subscribe', 'click here', 'privacy policy',
+        'all rights reserved', 'terms of service', 'sign up',
+    ]
+    if sum(1 for m in boilerplate_markers if m in lowered) >= 3:
+        return False
+    return True
+
+
+def _difficulty_score(text: str) -> float:
+    """Curriculum difficulty: composite of word length, vocab richness, sentence length."""
+    words = text.split()
+    if not words:
+        return 0.0
+    avg_word_len = sum(len(w) for w in words) / len(words)
+    vocab_richness = len(set(words)) / len(words)
+    sentences = max(text.count('.') + text.count('!') + text.count('?'), 1)
+    avg_sentence_len = len(words) / sentences
+    return (avg_word_len / 10) * 0.3 + vocab_richness * 0.4 + (avg_sentence_len / 30) * 0.3
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: Data Preparation (untimed) — in-memory decode pipeline
 # ---------------------------------------------------------------------------
 def phase0_data_prep() -> None:
+    import multiprocessing as mp
+    import numpy as np
+
     banner("PHASE 0: DATA PREPARATION (untimed)")
     t0 = time.time()
 
-    # Step 0.1 — Train BESE BPE (248 merges on full FineWeb)
+    sys.path.insert(0, str(BESE_DIR / "tokenizer"))
+
+    # ------------------------------------------------------------------
+    # Step 0.1 — Parallel decode SP shards → text strings in memory
+    # ------------------------------------------------------------------
+    banner("Step 0.1: Decode SP shards → in-memory text")
+
+    if not SP_MODEL.exists():
+        raise FileNotFoundError(f"SentencePiece model not found: {SP_MODEL}")
+
+    train_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_train_*.bin"))
+    val_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_val_*.bin"))
+    if not train_shard_files:
+        raise FileNotFoundError(f"No SP train shards in {SP_SHARD_DIR}")
+    log(f"  Found {len(train_shard_files)} train + {len(val_shard_files)} val SP shards")
+
+    sp_model_path = str(SP_MODEL)
+    num_workers = min(mp.cpu_count(), len(train_shard_files), 80)
+    log(f"  Using {num_workers} workers for parallel decode")
+
+    train_docs = []
+    train_args = [(f, sp_model_path, 50) for f in train_shard_files]
+    with mp.Pool(num_workers) as pool:
+        for name, n, docs in pool.imap(_decode_shard, train_args):
+            train_docs.extend(docs)
+            if len(train_docs) % 500_000 < len(docs):
+                log(f"    {name}: {n:,} tokens → {len(docs):,} docs (total: {len(train_docs):,})")
+
+    val_docs = []
+    val_args = [(f, sp_model_path, 50) for f in val_shard_files]
+    with mp.Pool(min(num_workers, max(len(val_shard_files), 1))) as pool:
+        for name, n, docs in pool.imap(_decode_shard, val_args):
+            val_docs.extend(docs)
+
+    log(f"  Decoded: {len(train_docs):,} train docs, {len(val_docs):,} val docs")
+    elapsed_decode = time.time() - t0
+    log(f"  Decode time: {elapsed_decode:.1f}s ({elapsed_decode / 60:.1f} min)")
+
+    # ------------------------------------------------------------------
+    # Step 0.2 — Quality filter in-memory
+    # ------------------------------------------------------------------
+    banner("Step 0.2: Quality filter (is_high_value)")
+    t_filt = time.time()
+    before = len(train_docs)
+    train_docs = [d for d in train_docs if _is_high_value(d)]
+    log(f"  Filtered {before:,} → {len(train_docs):,} docs ({before - len(train_docs):,} removed)")
+    log(f"  Filter time: {time.time() - t_filt:.1f}s")
+
+    # ------------------------------------------------------------------
+    # Step 0.3 — Train BESE BPE (248 merges) directly on text list
+    # ------------------------------------------------------------------
     if BPE_OUTPUT.exists():
-        log(f"  Step 0.1: BPE tokenizer already exists at {BPE_OUTPUT}, skipping")
+        log(f"  Step 0.3: BPE tokenizer already exists at {BPE_OUTPUT}, skipping")
+        from bese_fast_bpe import FastBESEBPETokenizer
+        tok = FastBESEBPETokenizer.load(str(BPE_OUTPUT))
     else:
-        banner("Step 0.1: Train BESE BPE (248 merges)")
-        if not BPE_INPUT.exists():
-            raise FileNotFoundError(
-                f"BPE input not found: {BPE_INPUT}\n"
-                "Decode SP shards to JSONL first (see docs/run_v5_plan.md)."
-            )
-        run_cmd(
-            [
-                sys.executable,
-                str(BESE_DIR / "scripts" / "train_bpe_jsonl.py"),
-                "--input", str(BPE_INPUT),
-                "--output", str(BPE_OUTPUT),
-                "--num-merges", "248",
-                "--max-docs", "6000000",
-            ],
-            cwd=BESE_DIR,
-            label="BPE train",
-        )
+        banner("Step 0.3: Train BESE BPE (248 merges)")
+        from bese_fast_bpe import train_bpe_merges_fast, FastBESEBPETokenizer
 
-    # Step 0.2 — Curriculum sort
-    if CURRICULUM_OUTPUT.exists():
-        log(f"  Step 0.2: Curriculum-sorted JSONL already exists at {CURRICULUM_OUTPUT}, skipping")
+        t_bpe = time.time()
+        merges = train_bpe_merges_fast(train_docs[:50000], num_merges=248, verbose=True)
+        tok = FastBESEBPETokenizer(merges=merges)
+        log(f"  Vocab size: {tok.vocab_size}")
+
+        BPE_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        tok.save(BPE_OUTPUT)
+        log(f"  Saved tokenizer to {BPE_OUTPUT} ({time.time() - t_bpe:.1f}s)")
+
+    # ------------------------------------------------------------------
+    # Step 0.4 — Curriculum sort in-memory (sort by difficulty_score)
+    # ------------------------------------------------------------------
+    banner("Step 0.4: Curriculum sort (easy → hard)")
+    t_sort = time.time()
+    train_docs.sort(key=_difficulty_score)
+    log(f"  Sorted {len(train_docs):,} docs by difficulty ({time.time() - t_sort:.1f}s)")
+
+    # ------------------------------------------------------------------
+    # Step 0.5 — Export BESE shards from in-memory texts
+    # ------------------------------------------------------------------
+    train_shards_exist = list(SHARD_DIR.glob("fineweb_train_*.bin"))
+    if train_shards_exist:
+        log(f"  Step 0.5: Found {len(train_shards_exist)} existing train shards in {SHARD_DIR}, skipping")
     else:
-        banner("Step 0.2: Curriculum sort (easy-to-hard)")
-        if not BPE_INPUT.exists():
-            raise FileNotFoundError(f"Curriculum input not found: {BPE_INPUT}")
-        run_cmd(
-            [
-                sys.executable,
-                str(BESE_DIR / "scripts" / "curriculum_sort.py"),
-                "--input", str(BPE_INPUT),
-                "--output", str(CURRICULUM_OUTPUT),
-            ],
-            cwd=BESE_DIR,
-            label="curriculum sort",
-        )
+        banner("Step 0.5: Export BESE shards")
+        t_export = time.time()
+        SHARD_DIR.mkdir(parents=True, exist_ok=True)
+        HEADER_INTS = 256
+        SHARD_SIZE = 100_000_000
 
-    # Step 0.3+0.4 — Export v5 BESE shards (with quality filter)
-    train_shards = list(SHARD_DIR.glob("fineweb_train_*.bin"))
-    if train_shards:
-        log(f"  Step 0.3: Found {len(train_shards)} existing train shards in {SHARD_DIR}, skipping export")
-    else:
-        banner("Step 0.3: Export v5 BESE shards (filtered + curriculum-sorted)")
-        # Use curriculum-sorted input if available, otherwise raw
-        shard_input = CURRICULUM_OUTPUT if CURRICULUM_OUTPUT.exists() else BPE_INPUT
-        if not shard_input.exists():
-            raise FileNotFoundError(f"Shard input not found: {shard_input}")
-        run_cmd(
-            [
-                sys.executable,
-                str(BESE_DIR / "scripts" / "export_shards.py"),
-                "--input", str(shard_input),
-                "--tokenizer", str(BPE_OUTPUT),
-                "--output-dir", str(SHARD_DIR),
-                "--filter",
-                "--num-workers", "64",
-            ],
-            cwd=BESE_DIR,
-            label="shard export",
-        )
+        bpt = tok.get_bytes_per_token_lut()
 
-    # Step 0.5 — Build n-gram table
+        def write_shard(path, tokens):
+            header = np.zeros(HEADER_INTS, dtype="<i4")
+            header[0] = 20240520
+            header[1] = 1
+            header[2] = int(tokens.shape[0])
+            with open(path, "wb") as f:
+                f.write(header.tobytes())
+                f.write(tokens.astype("<u2").tobytes())
+            return int(tokens.shape[0])
+
+        # Encode + write val shards
+        log(f"  Encoding {len(val_docs):,} validation docs...")
+        val_chunks = []
+        for text in val_docs:
+            enc = tok.encode(text)
+            val_chunks.append(enc)
+        if val_chunks:
+            val_tokens = np.concatenate(val_chunks)
+            write_shard(SHARD_DIR / "fineweb_val_0.bin", val_tokens)
+            log(f"    Val shard: {val_tokens.shape[0]:,} tokens")
+            del val_tokens, val_chunks
+
+        # Encode + write train shards
+        # Cap to ~500M tokens (enough for 10-min run)
+        max_train_tokens = 500_000_000
+        est_docs = int(max_train_tokens / 400 * 1.25)
+        if len(train_docs) > est_docs:
+            log(f"  Capping train docs: {len(train_docs):,} → {est_docs:,}")
+            train_docs = train_docs[:est_docs]
+
+        log(f"  Encoding {len(train_docs):,} training docs...")
+        shard_idx = 0
+        chunks = []
+        total_tokens = 0
+        for i, text in enumerate(train_docs):
+            enc = tok.encode(text)
+            chunks.append(enc)
+            total_tokens += len(enc)
+            if (i + 1) % 100_000 == 0:
+                log(f"    {i+1:,}/{len(train_docs):,} docs, {total_tokens:,} tokens so far")
+            if total_tokens >= SHARD_SIZE:
+                shard_tokens = np.concatenate(chunks)
+                path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
+                n = write_shard(path, shard_tokens)
+                log(f"    Train shard {shard_idx}: {n:,} tokens")
+                chunks = []
+                total_tokens = 0
+                shard_idx += 1
+        if chunks:
+            shard_tokens = np.concatenate(chunks)
+            path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
+            n = write_shard(path, shard_tokens)
+            log(f"    Train shard {shard_idx}: {n:,} tokens")
+            shard_idx += 1
+
+        log(f"  Exported {shard_idx} train shards + 1 val shard ({time.time() - t_export:.1f}s)")
+
+    # Free memory
+    del train_docs, val_docs
+
+    # ------------------------------------------------------------------
+    # Step 0.6 — Build n-gram table
+    # ------------------------------------------------------------------
     if NGRAM_TABLE.exists():
-        log(f"  Step 0.5: N-gram table already exists at {NGRAM_TABLE}, skipping")
+        log(f"  Step 0.6: N-gram table already exists at {NGRAM_TABLE}, skipping")
     else:
-        banner("Step 0.5: Build n-gram frequency table")
+        banner("Step 0.6: Build n-gram frequency table")
         first_shard = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
         if not first_shard:
             raise FileNotFoundError(f"No training shards found in {SHARD_DIR}")
@@ -315,7 +469,6 @@ def phase0_data_prep() -> None:
             cwd=BESE_DIR,
             label="ngram table",
         )
-        # Verify size fits in artifact budget
         if NGRAM_TABLE.exists():
             ngram_size = NGRAM_TABLE.stat().st_size
             log(f"  N-gram table size: {ngram_size:,} bytes ({ngram_size / 1024:.1f} KB)")
