@@ -287,6 +287,31 @@ def _difficulty_score(text: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker functions (must be top-level for multiprocessing pickling)
+# ---------------------------------------------------------------------------
+def _filter_chunk(docs: list) -> list:
+    """Filter a chunk of docs — runs in a worker process."""
+    return [d for d in docs if _is_high_value(d)]
+
+
+def _score_chunk(docs: list) -> list:
+    """Compute difficulty scores for a chunk of docs — runs in a worker process."""
+    return [_difficulty_score(d) for d in docs]
+
+
+def _encode_chunk(args: tuple) -> "np.ndarray":
+    """Encode a chunk of docs with the BESE tokenizer — runs in a worker process."""
+    docs, tok_path, bese_tok_root = args
+    import sys
+    import numpy as np
+    sys.path.insert(0, bese_tok_root)
+    from bese_fast_bpe import FastBESEBPETokenizer
+    tok = FastBESEBPETokenizer.load(tok_path)
+    arrays = [np.asarray(tok.encode(text), dtype=np.uint16) for text in docs]
+    return np.concatenate(arrays) if arrays else np.array([], dtype=np.uint16)
+
+
+# ---------------------------------------------------------------------------
 # Phase 0: Data Preparation (untimed) — in-memory decode pipeline
 # ---------------------------------------------------------------------------
 def phase0_data_prep() -> None:
@@ -335,12 +360,18 @@ def phase0_data_prep() -> None:
     log(f"  Decode time: {elapsed_decode:.1f}s ({elapsed_decode / 60:.1f} min)")
 
     # ------------------------------------------------------------------
-    # Step 0.2 — Quality filter in-memory
+    # Step 0.2 — Quality filter in-memory (parallel)
     # ------------------------------------------------------------------
-    banner("Step 0.2: Quality filter (is_high_value)")
+    banner("Step 0.2: Quality filter (is_high_value) — parallel")
     t_filt = time.time()
     before = len(train_docs)
-    train_docs = [d for d in train_docs if _is_high_value(d)]
+    N_WORKERS = min(mp.cpu_count(), 200)
+    chunk_size = max(1000, len(train_docs) // N_WORKERS)
+    chunks = [train_docs[i:i + chunk_size] for i in range(0, len(train_docs), chunk_size)]
+    log(f"  Filtering {before:,} docs across {len(chunks)} chunks with {N_WORKERS} workers...")
+    with mp.Pool(N_WORKERS) as pool:
+        filtered_chunks = pool.map(_filter_chunk, chunks)
+    train_docs = [d for chunk in filtered_chunks for d in chunk]
     log(f"  Filtered {before:,} → {len(train_docs):,} docs ({before - len(train_docs):,} removed)")
     log(f"  Filter time: {time.time() - t_filt:.1f}s")
 
@@ -365,11 +396,17 @@ def phase0_data_prep() -> None:
         log(f"  Saved tokenizer to {BPE_OUTPUT} ({time.time() - t_bpe:.1f}s)")
 
     # ------------------------------------------------------------------
-    # Step 0.4 — Curriculum sort in-memory (sort by difficulty_score)
+    # Step 0.4 — Curriculum sort in-memory (parallel score, then sort)
     # ------------------------------------------------------------------
-    banner("Step 0.4: Curriculum sort (easy → hard)")
+    banner("Step 0.4: Curriculum sort (easy → hard) — parallel scoring")
     t_sort = time.time()
-    train_docs.sort(key=_difficulty_score)
+    chunk_size = max(1000, len(train_docs) // N_WORKERS)
+    score_chunks = [train_docs[i:i + chunk_size] for i in range(0, len(train_docs), chunk_size)]
+    log(f"  Scoring {len(train_docs):,} docs across {len(score_chunks)} chunks with {N_WORKERS} workers...")
+    with mp.Pool(N_WORKERS) as pool:
+        score_results = pool.map(_score_chunk, score_chunks)
+    scores = [s for chunk in score_results for s in chunk]
+    train_docs = [doc for _, doc in sorted(zip(scores, train_docs), key=lambda x: x[0])]
     log(f"  Sorted {len(train_docs):,} docs by difficulty ({time.time() - t_sort:.1f}s)")
 
     # ------------------------------------------------------------------
@@ -397,46 +434,55 @@ def phase0_data_prep() -> None:
                 f.write(tokens.astype("<u2").tobytes())
             return int(tokens.shape[0])
 
-        # Encode + write val shards
-        log(f"  Encoding {len(val_docs):,} validation docs...")
-        val_chunks = []
-        for text in val_docs:
-            enc = tok.encode(text)
-            val_chunks.append(enc)
-        if val_chunks:
-            val_tokens = np.concatenate(val_chunks)
+        ENCODE_WORKERS = min(mp.cpu_count(), 128)
+        ENCODE_CHUNK = 5000  # docs per worker task
+        bese_tok_root = str(BESE_DIR / "tokenizer")
+        tok_path = str(BPE_OUTPUT)
+
+        # Encode + write val shard (parallel)
+        log(f"  Encoding {len(val_docs):,} validation docs (parallel, {ENCODE_WORKERS} workers)...")
+        val_enc_chunks = [val_docs[i:i + ENCODE_CHUNK] for i in range(0, len(val_docs), ENCODE_CHUNK)]
+        val_enc_args = [(c, tok_path, bese_tok_root) for c in val_enc_chunks]
+        with mp.Pool(ENCODE_WORKERS) as pool:
+            val_arrays = pool.map(_encode_chunk, val_enc_args)
+        if val_arrays:
+            val_tokens = np.concatenate(val_arrays)
             write_shard(SHARD_DIR / "fineweb_val_0.bin", val_tokens)
             log(f"    Val shard: {val_tokens.shape[0]:,} tokens")
-            del val_tokens, val_chunks
+            del val_tokens, val_arrays
 
-        # Encode + write train shards
-        # Cap to ~500M tokens (enough for 10-min run)
+        # Cap train docs to ~500M tokens
         max_train_tokens = 500_000_000
         est_docs = int(max_train_tokens / 400 * 1.25)
         if len(train_docs) > est_docs:
             log(f"  Capping train docs: {len(train_docs):,} → {est_docs:,}")
             train_docs = train_docs[:est_docs]
 
-        log(f"  Encoding {len(train_docs):,} training docs...")
+        # Encode train docs in parallel, write shards as token buffer fills
+        log(f"  Encoding {len(train_docs):,} training docs (parallel, {ENCODE_WORKERS} workers)...")
+        train_enc_chunks = [train_docs[i:i + ENCODE_CHUNK] for i in range(0, len(train_docs), ENCODE_CHUNK)]
+        train_enc_args = [(c, tok_path, bese_tok_root) for c in train_enc_chunks]
         shard_idx = 0
-        chunks = []
-        total_tokens = 0
-        for i, text in enumerate(train_docs):
-            enc = tok.encode(text)
-            chunks.append(enc)
-            total_tokens += len(enc)
-            if (i + 1) % 100_000 == 0:
-                log(f"    {i+1:,}/{len(train_docs):,} docs, {total_tokens:,} tokens so far")
-            if total_tokens >= SHARD_SIZE:
-                shard_tokens = np.concatenate(chunks)
-                path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
-                n = write_shard(path, shard_tokens)
-                log(f"    Train shard {shard_idx}: {n:,} tokens")
-                chunks = []
-                total_tokens = 0
-                shard_idx += 1
-        if chunks:
-            shard_tokens = np.concatenate(chunks)
+        buffer = []
+        buffer_tokens = 0
+        with mp.Pool(ENCODE_WORKERS) as pool:
+            for chunk_idx, arr in enumerate(pool.imap(_encode_chunk, train_enc_args)):
+                buffer.append(arr)
+                buffer_tokens += len(arr)
+                if (chunk_idx + 1) % 20 == 0:
+                    log(f"    Encoded {(chunk_idx+1)*ENCODE_CHUNK:,}/{len(train_docs):,} docs, {buffer_tokens:,} tokens buffered")
+                while buffer_tokens >= SHARD_SIZE:
+                    combined = np.concatenate(buffer)
+                    shard_tokens = combined[:SHARD_SIZE]
+                    remainder = combined[SHARD_SIZE:]
+                    path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
+                    n = write_shard(path, shard_tokens)
+                    log(f"    Train shard {shard_idx}: {n:,} tokens")
+                    shard_idx += 1
+                    buffer = [remainder] if len(remainder) > 0 else []
+                    buffer_tokens = len(remainder)
+        if buffer and buffer_tokens > 0:
+            shard_tokens = np.concatenate(buffer)
             path = SHARD_DIR / f"fineweb_train_{shard_idx:06d}.bin"
             n = write_shard(path, shard_tokens)
             log(f"    Train shard {shard_idx}: {n:,} tokens")
