@@ -59,6 +59,7 @@ BPE_OUTPUT = NET_VOL / "tokenizers" / "bese_bpe_1024_v7.json"
 SHARD_DIR = NET_VOL / "bese_shards_v7"
 NGRAM_TABLE = NET_VOL / "artifacts" / "ngram_table_v7.bin"
 LOGFILE = NET_VOL / "logs" / "run_v7.log"
+DECODED_CACHE = NET_VOL / "artifacts" / "decoded_docs_v7.pkl"  # Step 0.1 checkpoint
 
 # ---------------------------------------------------------------------------
 # Training environment (v7 configuration)
@@ -396,38 +397,49 @@ def phase0_data_prep() -> None:
     # ------------------------------------------------------------------
     banner("Step 0.1: Decode SP shards → in-memory text")
 
-    if not SP_MODEL.exists():
-        raise FileNotFoundError(f"SentencePiece model not found: {SP_MODEL}")
+    import pickle as _pickle
+    if DECODED_CACHE.exists():
+        log(f"  Loading decoded docs from cache: {DECODED_CACHE}")
+        with open(DECODED_CACHE, "rb") as _f:
+            scored_train, val_docs = _pickle.load(_f)
+        log(f"  Loaded {len(scored_train):,} train docs, {len(val_docs):,} val docs from cache")
+    else:
+        if not SP_MODEL.exists():
+            raise FileNotFoundError(f"SentencePiece model not found: {SP_MODEL}")
 
-    train_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_train_*.bin"))
-    val_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_val_*.bin"))
-    if not train_shard_files:
-        raise FileNotFoundError(f"No SP train shards in {SP_SHARD_DIR}")
-    log(f"  Found {len(train_shard_files)} train + {len(val_shard_files)} val SP shards")
+        train_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_train_*.bin"))
+        val_shard_files = sorted(SP_SHARD_DIR.glob("fineweb_val_*.bin"))
+        if not train_shard_files:
+            raise FileNotFoundError(f"No SP train shards in {SP_SHARD_DIR}")
+        log(f"  Found {len(train_shard_files)} train + {len(val_shard_files)} val SP shards")
 
-    sp_model_path = str(SP_MODEL)
-    num_workers = min(mp.cpu_count(), len(train_shard_files))
-    log(f"  Using {num_workers} workers for parallel decode")
+        sp_model_path = str(SP_MODEL)
+        num_workers = min(mp.cpu_count(), len(train_shard_files))
+        log(f"  Using {num_workers} workers for parallel decode")
 
-    scored_train = []
-    train_args = [(f, sp_model_path, 50) for f in train_shard_files]
-    with mp.Pool(num_workers) as pool:
-        for name, n, scored_docs in pool.imap(_decode_shard, train_args):
-            scored_train.extend(scored_docs)
-            if len(scored_train) % 500_000 < len(scored_docs):
-                log(f"    {name}: {n:,} tokens → {len(scored_docs):,} docs (total: {len(scored_train):,})")
+        scored_train = []
+        train_args = [(f, sp_model_path, 50) for f in train_shard_files]
+        with mp.Pool(num_workers) as pool:
+            for name, n, scored_docs in pool.imap(_decode_shard, train_args):
+                scored_train.extend(scored_docs)
+                if len(scored_train) % 500_000 < len(scored_docs):
+                    log(f"    {name}: {n:,} tokens → {len(scored_docs):,} docs (total: {len(scored_train):,})")
 
-    val_docs = []
-    val_args = [(f, sp_model_path, 50) for f in val_shard_files]
-    with mp.Pool(min(num_workers, max(len(val_shard_files), 1))) as pool:
-        for name, n, scored_docs in pool.imap(_decode_shard, val_args):
-            val_docs.extend(doc for _, doc in scored_docs)
+        val_docs = []
+        val_args = [(f, sp_model_path, 50) for f in val_shard_files]
+        with mp.Pool(min(num_workers, max(len(val_shard_files), 1))) as pool:
+            for name, n, scored_docs in pool.imap(_decode_shard, val_args):
+                val_docs.extend(doc for _, doc in scored_docs)
 
-    log(f"  Decoded + filtered + scored: {len(scored_train):,} train docs, {len(val_docs):,} val docs")
-    elapsed_decode = time.time() - t0
-    log(f"  Decode+filter+score time: {elapsed_decode:.1f}s ({elapsed_decode / 60:.1f} min)")
-    # Steps 0.2 and 0.4 (filter + scoring) now happen inside _decode_shard workers
-    # instead of single-threaded in the parent. Saves ~12 min on 224-CPU pods.
+        elapsed_decode = time.time() - t0
+        log(f"  Decoded + filtered + scored: {len(scored_train):,} train docs, {len(val_docs):,} val docs")
+        log(f"  Decode+filter+score time: {elapsed_decode:.1f}s ({elapsed_decode / 60:.1f} min)")
+
+        log(f"  Saving decoded docs cache to {DECODED_CACHE} ...")
+        DECODED_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DECODED_CACHE, "wb") as _f:
+            _pickle.dump((scored_train, val_docs), _f, protocol=_pickle.HIGHEST_PROTOCOL)
+        log(f"  Cache saved ({DECODED_CACHE.stat().st_size / 1e9:.1f} GB)")
 
     # ------------------------------------------------------------------
     # Step 0.3 — Train BESE BPE (1024 merges) directly on text list
