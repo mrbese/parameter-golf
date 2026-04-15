@@ -24,6 +24,11 @@ _BESE_TOK_ROOT = os.environ.get("BESE_TOKENIZER_ROOT", "")
 if _BESE_TOK_ROOT:
     sys.path.insert(0, _BESE_TOK_ROOT)
 
+# Mamba-3 hybrid support
+_MODEL_TYPE = os.environ.get("MODEL_TYPE", "transformer")
+if _MODEL_TYPE == "mamba_hybrid":
+    from integration.mamba3_ssd import HybridMambaGPT
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -94,6 +99,15 @@ class Hyperparameters:
     ngram_tilt_max_n = int(os.environ.get("NGRAM_TILT_MAX_N", 4))
     ngram_prior_path = os.environ.get("NGRAM_PRIOR_PATH", "")
 
+    # v8: Noisy QAT (Gaussian noise calibrated to INT6 quantization error)
+    noisy_qat_enabled = bool(int(os.environ.get("NOISY_QAT_ENABLED", "0")))
+    noisy_qat_activation_frac = float(os.environ.get("NOISY_QAT_ACTIVATION_FRAC", 0.20))
+    noisy_qat_clip_range = int(os.environ.get("NOISY_QAT_CLIP_RANGE", 31))
+
+    # v8: Bigram prior (frozen log-prob matrix as logit bias)
+    bigram_prior_enabled = bool(int(os.environ.get("BIGRAM_PRIOR_ENABLED", "0")))
+    bigram_prior_path = os.environ.get("BIGRAM_PRIOR_PATH", "")
+
     # v6.1: Legal TTT (test-time training) at eval
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
@@ -113,6 +127,14 @@ class Hyperparameters:
 
     # v5: EMA decay (was hardcoded to 0.997)
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # v7: Mamba-3 hybrid
+    model_type = os.environ.get("MODEL_TYPE", "transformer")
+    d_state = int(os.environ.get("D_STATE", 64))
+    mamba_expand = int(os.environ.get("MAMBA_EXPAND", 2))
+    mamba_headdim = int(os.environ.get("MAMBA_HEADDIM", 64))
+    mamba_chunk_size = int(os.environ.get("MAMBA_CHUNK_SIZE", 64))
+    attn_layer_pos = int(os.environ.get("ATTN_LAYER_POS", 4))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -524,15 +546,30 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
+    _noisy_qat_enabled: bool = False
+    _noisy_qat_clip_range: int = 31
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
+        if self.training and w.ndim == 2:
+            if CastedLinear._noisy_qat_enabled:
+                # v8: Noisy QAT — inject Gaussian noise calibrated to INT6 quantization error.
+                # Quantization step delta = row_max / clip_range.
+                # Uniform rounding error has std = delta / sqrt(12).
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    clip_range = CastedLinear._noisy_qat_clip_range
+                    row_max = w32.abs().amax(dim=1).clamp_min(1e-8)
+                    delta = row_max / clip_range
+                    noise_std = delta / (12.0 ** 0.5)
+                noise = torch.randn_like(w) * noise_std[:, None].to(w.dtype)
+                w = w + noise
+            elif CastedLinear._qat_enabled:
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    row_max = w32.abs().amax(dim=1)
+                    scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                    w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -706,7 +743,7 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
@@ -719,7 +756,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
@@ -771,7 +808,7 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -818,6 +855,9 @@ class GPT(nn.Module):
         # This avoids torch.compile recompilation every step — it only changes once.
         self._rec_loops = 1
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # v8: Frozen bigram log-probability prior (logit bias during training + inference)
+        self._bigram_prior_active = False
+        self.bigram_prior_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -903,6 +943,14 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def load_bigram_prior(self, path: str) -> None:
+        """Load frozen bigram log-prob matrix as a non-parameter buffer."""
+        mat = torch.load(path, map_location="cpu", weights_only=True)  # [V, V] float32
+        # Move to model's device (load is CPU, model may already be on CUDA)
+        device = next(self.parameters()).device
+        self.register_buffer("bigram_prior_mat", mat.to(device))
+        self._bigram_prior_active = True
+
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -993,6 +1041,11 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
+        # v8: Bigram prior logit bias (before softcap)
+        if self._bigram_prior_active:
+            prev_tokens = input_ids.reshape(-1)
+            bias = self.bigram_prior_mat.to(logits_proj.device)[prev_tokens.long()]
+            logits_proj = logits_proj + self.bigram_prior_scale * bias.to(logits_proj.dtype)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
@@ -1027,6 +1080,10 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        # v8: Bigram prior logit bias (before softcap)
+        if self._bigram_prior_active:
+            bias = self.bigram_prior_mat.to(logits_proj.device)[input_ids.long()]
+            logits_proj = logits_proj + self.bigram_prior_scale * bias.to(logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 # --- Sliding window evaluation ---
@@ -1280,9 +1337,13 @@ def _run_ttt_sliding_window_eval(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if ".mlp." in name or "mlp_fc" in name or "mlp_proj" in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    if ".attn." in name or "c_q" in name or "c_k" in name or "c_v" in name or "c_proj" in name:
+        return "attn"
+    if "in_proj" in name or "out_proj" in name:
+        return "mamba"
+    if ".proj." in name and ".mlp." not in name:
         return "attn"
     return "other"
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31, clip_percentiles: list[float] | None = None) -> tuple[Tensor, Tensor]:
@@ -1385,7 +1446,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not t.is_floating_point() or t.numel() <= 65536 or "bigram_prior" in name:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
             continue
@@ -1524,131 +1585,213 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=args.mtp_num_heads,
-        mtp_loss_weight=args.mtp_loss_weight,
-        bigram_vocab_size=args.bigram_vocab_size,
-        bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims,
-        ln_scale=args.ln_scale,
-        dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled,
-        ve_dim=args.ve_dim,
-        ve_layers=args.ve_layers,
-        gated_attention=args.gated_attention,
-        value_residual=args.value_residual,
-        parallel_residual_start=args.parallel_residual_start,
-        depth_recurrence_start=args.depth_recurrence_start,
-        depth_recurrence_end=args.depth_recurrence_end,
-        depth_recurrence_loops=args.depth_recurrence_loops,
-        depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
-    ).to(device).bfloat16()
-    # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
-    base_model.qo_bank.data = base_model.qo_bank.data.float()
-    base_model.kv_bank.data = base_model.kv_bank.data.float()
-    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
-    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
+    if args.model_type == "mamba_hybrid":
+        from integration.mamba3_ssd import HybridMambaGPT
+        base_model = HybridMambaGPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            d_state=args.d_state,
+            expand=args.mamba_expand,
+            headdim=args.mamba_headdim,
+            chunk_size=args.mamba_chunk_size,
+            attn_pos=args.attn_layer_pos,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            rope_dims=args.rope_dims,
+            logit_softcap=args.logit_softcap,
+            tied_embed_init_std=args.tied_embed_init_std,
+            depth_recurrence_start=args.depth_recurrence_start,
+            depth_recurrence_end=args.depth_recurrence_end,
+            depth_recurrence_loops=args.depth_recurrence_loops,
+            depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
+        ).to(device).bfloat16()
+    else:
+        base_model = GPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=args.mtp_num_heads,
+            mtp_loss_weight=args.mtp_loss_weight,
+            bigram_vocab_size=args.bigram_vocab_size,
+            bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims,
+            ln_scale=args.ln_scale,
+            dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled,
+            ve_dim=args.ve_dim,
+            ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention,
+            value_residual=args.value_residual,
+            parallel_residual_start=args.parallel_residual_start,
+            depth_recurrence_start=args.depth_recurrence_start,
+            depth_recurrence_end=args.depth_recurrence_end,
+            depth_recurrence_loops=args.depth_recurrence_loops,
+            depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
+        ).to(device).bfloat16()
+        # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
+        base_model.qo_bank.data = base_model.qo_bank.data.float()
+        base_model.kv_bank.data = base_model.kv_bank.data.float()
+        base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
+        base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # v8: Load bigram prior
+    if args.model_type != "mamba_hybrid" and args.bigram_prior_enabled and args.bigram_prior_path and os.path.exists(args.bigram_prior_path):
+        base_model.load_bigram_prior(args.bigram_prior_path)
+        log0(f"bigram_prior:loaded path:{args.bigram_prior_path}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    try:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    except Exception as e:
+        log0(f"torch.compile failed ({e}), using eager mode")
+        compiled_model = base_model
     model = compiled_model
 
-    # Optimizer split:
-    # - 4 parameter banks -> Muon (batched Newton-Schulz)
-    # - token embedding -> Adam
-    # - scalars/control tensors -> Adam
-    # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
-    matrix_params = [
-        base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
-    ]
-    block_named_params = list(base_model.blocks.named_parameters())
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear.gate)
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
-    if base_model.ve_shared is not None:
-        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.ve_shared.proj is not None:
-            scalar_params.append(base_model.ve_shared.proj.weight)
-        scalar_params.append(base_model.ve_shared.scale)
-        for s in base_model.ve_layer_scales:
-            scalar_params.append(s)
-    optimizer_tok = torch.optim.AdamW(
-        tok_params,
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_wd,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.AdamW(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    # Non-bank params that need manual all-reduce (replicated across GPUs)
-    replicated_params = list(optimizer_tok.param_groups[0]["params"])
-    for pg in optimizer_tok.param_groups[1:]:
-        replicated_params.extend(pg["params"])
-    replicated_params.extend(scalar_params)
-
-    optimizer_head = None
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+    if args.model_type == "mamba_hybrid":
+        # v7: Mamba hybrid optimizer setup
+        # 2D weight matrices (ndim>=2, numel>4096) -> Muon (Newton-Schulz)
+        # 1D params (biases, norms, scales, D, dt_bias, A_log) -> Adam
+        # Token embedding -> Adam (separate LR)
+        token_lr = args.tied_embed_lr  # Mamba always uses tied embeddings
+        matrix_params = []
+        scalar_params = []
+        tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+        for name, p in base_model.named_parameters():
+            if "tok_emb" in name:
+                continue  # already in tok_params
+            elif p.ndim >= 2 and p.numel() > 4096:
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+        optimizer_tok = torch.optim.AdamW(
+            tok_params,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adam_wd,
             fused=True,
         )
-        replicated_params.append(base_model.lm_head.weight)
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_head is not None:
-        optimizers.append(optimizer_head)
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_wd,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.AdamW(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        replicated_params = list(optimizer_tok.param_groups[0]["params"])
+        replicated_params.extend(scalar_params)
+        optimizer_head = None  # Mamba uses tied embeddings, no separate lm_head
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    else:
+        # Optimizer split:
+        # - 4 parameter banks -> Muon (batched Newton-Schulz)
+        # - token embedding -> Adam
+        # - scalars/control tensors -> Adam
+        # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
+        matrix_params = [
+            base_model.qo_bank, base_model.kv_bank,
+            base_model.mlp_up_bank, base_model.mlp_down_bank,
+        ]
+        block_named_params = list(base_model.blocks.named_parameters())
+        scalar_params = [
+            p
+            for name, p in block_named_params
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        if base_model.skip_weights.numel() > 0:
+            scalar_params.append(base_model.skip_weights)
+        scalar_params.append(base_model.smear.gate)
+        if base_model._bigram_prior_active:
+            scalar_params.append(base_model.bigram_prior_scale)
+        if base_model.bigram is not None:
+            scalar_params.append(base_model.bigram.scale)
+        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+        tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+        if base_model.bigram is not None:
+            tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if base_model.bigram.proj is not None:
+                scalar_params.append(base_model.bigram.proj.weight)
+        if base_model.ve_shared is not None:
+            tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if base_model.ve_shared.proj is not None:
+                scalar_params.append(base_model.ve_shared.proj.weight)
+            scalar_params.append(base_model.ve_shared.scale)
+            for s in base_model.ve_layer_scales:
+                scalar_params.append(s)
+        optimizer_tok = torch.optim.AdamW(
+            tok_params,
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_wd,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.AdamW(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        # Non-bank params that need manual all-reduce (replicated across GPUs)
+        replicated_params = list(optimizer_tok.param_groups[0]["params"])
+        for pg in optimizer_tok.param_groups[1:]:
+            replicated_params.extend(pg["params"])
+        replicated_params.extend(scalar_params)
+
+        optimizer_head = None
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            replicated_params.append(base_model.lm_head.weight)
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if optimizer_head is not None:
+            optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
-    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters()) if hasattr(base_model, 'mtp_heads') else 0
     log0(f"model_params:{n_params}")
-    log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
-    log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    if args.model_type != "mamba_hybrid":
+        log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+        xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+        log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    else:
+        log0(f"model_type:mamba_hybrid d_state:{args.d_state} expand:{args.mamba_expand} attn_pos:{args.attn_layer_pos}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1757,6 +1900,13 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        # v8: Noisy QAT activation based on training progress fraction
+        if args.noisy_qat_enabled and not CastedLinear._noisy_qat_enabled:
+            training_progress = getattr(base_model, '_training_progress', 0.0)
+            if training_progress >= args.noisy_qat_activation_frac:
+                CastedLinear._noisy_qat_enabled = True
+                CastedLinear._noisy_qat_clip_range = args.noisy_qat_clip_range
+                log0(f"noisy_qat:enabled step:{step} progress:{training_progress:.3f} clip_range:{args.noisy_qat_clip_range}")
         zero_grad_all()
         # v5: update training progress for depth recurrence activation
         # Use wallclock fraction (not step fraction) since training is wallclock-capped
@@ -1868,7 +2018,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
-    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+    export_sd = {k: v for k, v in full_state_dict.items()
+                 if "mtp_heads" not in k and k != "bigram_prior_mat"}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
@@ -1878,10 +2029,17 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
+    # v8: Disable QAT noise before quantization
+    CastedLinear._noisy_qat_enabled = False
+    CastedLinear._qat_enabled = False
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
+    if args.model_type == "mamba_hybrid":
+        unbanked_sd = sd_cpu  # Mamba model has no banks to unbank
+    else:
+        unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    int6_cats = {"mlp", "attn", "mamba"} if args.model_type == "mamba_hybrid" else {"mlp", "attn"}
+    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, int6_cats)
     save_dict = {"w": quant_result, "m": quant_meta}
     # Bundle n-gram prior table if it exists
     ngram_path = os.environ.get("NGRAM_PRIOR_PATH", "")
@@ -1918,36 +2076,70 @@ def main() -> None:
         log0(f"Extracted bundled n-gram prior: {len(quant_state['ngram']):,} bytes → {_ngram_tmp.name}")
         del quant_state["ngram"]
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
-    # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
-    eval_model = GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=0, mtp_loss_weight=0.0,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        gated_attention=args.gated_attention, value_residual=args.value_residual,
-        parallel_residual_start=args.parallel_residual_start,
-        depth_recurrence_start=args.depth_recurrence_start,
-        depth_recurrence_end=args.depth_recurrence_end,
-        depth_recurrence_loops=args.depth_recurrence_loops,
-        depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
-    ).to(device).bfloat16()
-    eval_model._training_progress = 1.0  # v5: enable depth recurrence in eval
-    eval_model._rec_loops = args.depth_recurrence_loops
-    eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-    eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
-    for m in eval_model.modules():
-        if isinstance(m, CastedLinear):
-            m.float()
-    restore_low_dim_params_to_fp32(eval_model)
-    eval_model.load_state_dict(deq_state, strict=True)
+    if args.model_type == "mamba_hybrid":
+        deq_state = deq_unbanked  # Mamba model has no banks to rebank
+    else:
+        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    if args.model_type == "mamba_hybrid":
+        from integration.mamba3_ssd import HybridMambaGPT
+        eval_model = HybridMambaGPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            d_state=args.d_state,
+            expand=args.mamba_expand,
+            headdim=args.mamba_headdim,
+            chunk_size=args.mamba_chunk_size,
+            attn_pos=args.attn_layer_pos,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            rope_dims=args.rope_dims,
+            logit_softcap=args.logit_softcap,
+            tied_embed_init_std=args.tied_embed_init_std,
+            depth_recurrence_start=args.depth_recurrence_start,
+            depth_recurrence_end=args.depth_recurrence_end,
+            depth_recurrence_loops=args.depth_recurrence_loops,
+            depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
+        ).to(device).bfloat16()
+        eval_model._training_progress = 1.0
+        eval_model._rec_loops = args.depth_recurrence_loops
+        restore_low_dim_params_to_fp32(eval_model)
+        eval_model.load_state_dict(deq_state, strict=True)
+    else:
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+            parallel_residual_start=args.parallel_residual_start,
+            depth_recurrence_start=args.depth_recurrence_start,
+            depth_recurrence_end=args.depth_recurrence_end,
+            depth_recurrence_loops=args.depth_recurrence_loops,
+            depth_recurrence_activation_frac=args.depth_recurrence_activation_frac,
+        ).to(device).bfloat16()
+        eval_model._training_progress = 1.0  # v5: enable depth recurrence in eval
+        eval_model._rec_loops = args.depth_recurrence_loops
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
+        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+        for m in eval_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(eval_model)
+        eval_model.load_state_dict(deq_state, strict=True)
+        # v8: Load bigram prior on eval model (after state_dict — buffer excluded from artifact)
+        if args.bigram_prior_enabled and args.bigram_prior_path and os.path.exists(args.bigram_prior_path):
+            eval_model.load_bigram_prior(args.bigram_prior_path)
     # v5.2: run INT6 eval in eager mode — torch.compile(dynamic=True) wraps INT6
     # scale tensors as SymFloat proxies, causing AttributeError on .size() calls
     torch.cuda.synchronize()
