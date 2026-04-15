@@ -41,6 +41,16 @@ parameter golf chat.txt
 # Jupyter
 .ipynb_checkpoints/
 
+# Artifacts / large binaries
+artifacts/
+*.ptz
+
+# Run logs
+logs/
+
+# Claude project memory
+.claude/
+
 # Upstream clone (optional local copy)
 parameter-golf/
 parameter-golf-upstream/
