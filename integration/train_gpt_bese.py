@@ -94,6 +94,15 @@ class Hyperparameters:
     ngram_tilt_max_n = int(os.environ.get("NGRAM_TILT_MAX_N", 4))
     ngram_prior_path = os.environ.get("NGRAM_PRIOR_PATH", "")
 
+    # v8: Noisy QAT (Gaussian noise calibrated to INT6 quantization error)
+    noisy_qat_enabled = bool(int(os.environ.get("NOISY_QAT_ENABLED", "0")))
+    noisy_qat_activation_frac = float(os.environ.get("NOISY_QAT_ACTIVATION_FRAC", 0.20))
+    noisy_qat_clip_range = int(os.environ.get("NOISY_QAT_CLIP_RANGE", 31))
+
+    # v8: Bigram prior (frozen log-prob matrix as logit bias)
+    bigram_prior_enabled = bool(int(os.environ.get("BIGRAM_PRIOR_ENABLED", "0")))
+    bigram_prior_path = os.environ.get("BIGRAM_PRIOR_PATH", "")
+
     # v6.1: Legal TTT (test-time training) at eval
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
@@ -524,15 +533,30 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
+    _noisy_qat_enabled: bool = False
+    _noisy_qat_clip_range: int = 31
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
+        if self.training and w.ndim == 2:
+            if CastedLinear._noisy_qat_enabled:
+                # v8: Noisy QAT — inject Gaussian noise calibrated to INT6 quantization error.
+                # Quantization step delta = row_max / clip_range.
+                # Uniform rounding error has std = delta / sqrt(12).
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    clip_range = CastedLinear._noisy_qat_clip_range
+                    row_max = w32.abs().amax(dim=1).clamp_min(1e-8)
+                    delta = row_max / clip_range
+                    noise_std = delta / (12.0 ** 0.5)
+                noise = torch.randn_like(w) * noise_std[:, None].to(w.dtype)
+                w = w + noise
+            elif CastedLinear._qat_enabled:
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    row_max = w32.abs().amax(dim=1)
+                    scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                    w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -706,7 +730,7 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
@@ -719,7 +743,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
@@ -771,7 +795,7 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -818,6 +842,9 @@ class GPT(nn.Module):
         # This avoids torch.compile recompilation every step — it only changes once.
         self._rec_loops = 1
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # v8: Frozen bigram log-probability prior (logit bias during training + inference)
+        self._bigram_prior_active = False
+        self.bigram_prior_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -903,6 +930,14 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def load_bigram_prior(self, path: str) -> None:
+        """Load frozen bigram log-prob matrix as a non-parameter buffer."""
+        mat = torch.load(path, map_location="cpu", weights_only=True)  # [V, V] float32
+        # Move to model's device (load is CPU, model may already be on CUDA)
+        device = next(self.parameters()).device
+        self.register_buffer("bigram_prior_mat", mat.to(device))
+        self._bigram_prior_active = True
+
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -993,6 +1028,11 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
+        # v8: Bigram prior logit bias (before softcap)
+        if self._bigram_prior_active:
+            prev_tokens = input_ids.reshape(-1)
+            bias = self.bigram_prior_mat.to(logits_proj.device)[prev_tokens.long()]
+            logits_proj = logits_proj + self.bigram_prior_scale * bias.to(logits_proj.dtype)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
@@ -1027,6 +1067,10 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        # v8: Bigram prior logit bias (before softcap)
+        if self._bigram_prior_active:
+            bias = self.bigram_prior_mat.to(logits_proj.device)[input_ids.long()]
+            logits_proj = logits_proj + self.bigram_prior_scale * bias.to(logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 # --- Sliding window evaluation ---
@@ -1385,7 +1429,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not t.is_floating_point() or t.numel() <= 65536 or "bigram_prior" in name:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
             continue
@@ -1564,6 +1608,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # v8: Load bigram prior
+    if args.bigram_prior_enabled and args.bigram_prior_path and os.path.exists(args.bigram_prior_path):
+        base_model.load_bigram_prior(args.bigram_prior_path)
+        log0(f"bigram_prior:loaded path:{args.bigram_prior_path}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1587,6 +1635,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
+    if base_model._bigram_prior_active:
+        scalar_params.append(base_model.bigram_prior_scale)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1757,6 +1807,13 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        # v8: Noisy QAT activation based on training progress fraction
+        if args.noisy_qat_enabled and not CastedLinear._noisy_qat_enabled:
+            training_progress = getattr(base_model, '_training_progress', 0.0)
+            if training_progress >= args.noisy_qat_activation_frac:
+                CastedLinear._noisy_qat_enabled = True
+                CastedLinear._noisy_qat_clip_range = args.noisy_qat_clip_range
+                log0(f"noisy_qat:enabled step:{step} progress:{training_progress:.3f} clip_range:{args.noisy_qat_clip_range}")
         zero_grad_all()
         # v5: update training progress for depth recurrence activation
         # Use wallclock fraction (not step fraction) since training is wallclock-capped
@@ -1868,7 +1925,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
-    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+    export_sd = {k: v for k, v in full_state_dict.items()
+                 if "mtp_heads" not in k and k != "bigram_prior_mat"}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
@@ -1878,6 +1936,9 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
+    # v8: Disable QAT noise before quantization
+    CastedLinear._noisy_qat_enabled = False
+    CastedLinear._qat_enabled = False
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
@@ -1948,6 +2009,9 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
+    # v8: Load bigram prior on eval model (after state_dict — buffer excluded from artifact)
+    if args.bigram_prior_enabled and args.bigram_prior_path and os.path.exists(args.bigram_prior_path):
+        eval_model.load_bigram_prior(args.bigram_prior_path)
     # v5.2: run INT6 eval in eager mode — torch.compile(dynamic=True) wraps INT6
     # scale tensors as SymFloat proxies, causing AttributeError on .size() calls
     torch.cuda.synchronize()
