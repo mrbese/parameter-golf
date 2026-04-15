@@ -468,7 +468,7 @@ def phase0_data_prep() -> None:
         # if the library is missing — pip install tokenizers to enable.
         try:
             from bese_fast_bpe import train_bpe_merges_hf
-            import subprocess, sys
+            import subprocess
             subprocess.check_call([sys.executable, "-m", "pip", "install",
                                    "tokenizers", "-q", "--break-system-packages"],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
