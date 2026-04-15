@@ -57,9 +57,8 @@ SP_SHARD_DIR = PG_DIR / "data/datasets/fineweb10B_sp1024"
 BPE_OUTPUT = NET_VOL / "tokenizers" / "bese_bpe_248_v5.json"       # REUSE v5 tokenizer
 SHARD_DIR = NET_VOL / "bese_shards_v5"                              # REUSE v5/v6 shards
 NGRAM_TABLE = NET_VOL / "artifacts" / "ngram_table_v6.bin"          # REUSE v6 ngram table
-BIGRAM_PRIOR = NET_VOL / "artifacts" / "bigram_prior_v8.pt"         # NEW: 288x288 log-prob matrix
 TRAIN_SCRIPT = BESE_DIR / "integration" / "train_gpt_bese.py"
-LOGFILE = NET_VOL / "logs" / "run_v8.log"
+LOGFILE = NET_VOL / "logs" / "run_v8.2.log"
 
 # Ensure persistent directories exist
 for d in [NET_VOL / "checkpoints" / "v8", NET_VOL / "logs", NET_VOL / "artifacts"]:
@@ -94,16 +93,12 @@ TRAIN_ENV = {
     "NGRAM_TILT_ENABLED": "1",
     "NGRAM_TILT_MAX_N": "3",
     "NGRAM_PRIOR_PATH": str(NGRAM_TABLE),
-    # --- v8: Noisy QAT ---
-    "QAT_ENABLED": "0",                          # DISABLE old STE QAT
-    "NOISY_QAT_ENABLED": "1",                     # Gaussian noise QAT
-    "NOISY_QAT_ACTIVATION_FRAC": "0.20",          # Start at 20% of training
-    "NOISY_QAT_CLIP_RANGE": "31",                 # INT6 range
-    "LATE_QAT_THRESHOLD": "0",                     # Disable late STE QAT trigger
-    # --- v8: Bigram Prior ---
-    "BIGRAM_PRIOR_ENABLED": "1",                   # Frozen bigram log-prob prior
-    "BIGRAM_PRIOR_PATH": str(BIGRAM_PRIOR),        # path to 288x288 log-prob matrix
-    # --- TTT ---
+    # --- ALL v8 experiments DISABLED ---
+    "QAT_ENABLED": "0",
+    "NOISY_QAT_ENABLED": "0",
+    "BIGRAM_PRIOR_ENABLED": "0",
+    "LATE_QAT_THRESHOLD": "0",
+    # --- TTT (the only new thing) ---
     "TTT_ENABLED": "1",
     "TTT_LR": "0.005",
     "TTT_MOMENTUM": "0.9",
@@ -371,7 +366,7 @@ def phase1_training(num_gpus: int) -> str:
     log(f"  Shards: {len(train_shards)} train, {len(val_shards)} val")
 
     env = TRAIN_ENV.copy()
-    env["RUN_ID"] = "bese_v8"
+    env["RUN_ID"] = "bese_v8.2"
     env["BESE_TOKENIZER_ROOT"] = str(BESE_DIR / "tokenizer")
     env["VAL_LOSS_EVERY"] = "500"
     env["TRAIN_LOG_EVERY"] = "100"
@@ -490,11 +485,8 @@ def print_summary(metrics: dict, total_elapsed: float) -> None:
         f" x{TRAIN_ENV['DEPTH_RECURRENCE_LOOPS']} loops"
         f" (active after {float(TRAIN_ENV['DEPTH_RECURRENCE_ACTIVATION_FRAC']) * 100:.0f}% of training)")
     log(f"    parallel_residual: start={TRAIN_ENV['PARALLEL_RESIDUAL_START']}")
-    log(f"    noisy_qat: enabled={TRAIN_ENV['NOISY_QAT_ENABLED']} "
-        f"activation_frac={TRAIN_ENV['NOISY_QAT_ACTIVATION_FRAC']} "
-        f"clip_range={TRAIN_ENV['NOISY_QAT_CLIP_RANGE']}")
-    log(f"    bigram_prior: enabled={TRAIN_ENV['BIGRAM_PRIOR_ENABLED']} "
-        f"path={TRAIN_ENV['BIGRAM_PRIOR_PATH']}")
+    log(f"    noisy_qat: disabled")
+    log(f"    bigram_prior: disabled")
     log(f"    ttt: enabled={TRAIN_ENV['TTT_ENABLED']} "
         f"lr={TRAIN_ENV['TTT_LR']} epochs={TRAIN_ENV['TTT_EPOCHS']}")
 
@@ -567,9 +559,6 @@ def main() -> None:
     # Build ngram table if needed (reuses v6 table if it exists)
     if not args.skip_prep:
         _build_ngram_table()
-
-    # Build bigram prior matrix (one-time, ~10 seconds)
-    build_bigram_prior()
 
     # Phase 1: Training
     train_output = ""
