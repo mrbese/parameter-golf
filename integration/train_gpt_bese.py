@@ -1116,7 +1116,11 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    if isinstance(base_model, nn.Module) and hasattr(base_model, 'smear_gate'):
+        # Mamba hybrid — skip torch.compile (einops breaks fullgraph=True)
+        compiled_logits = base_model.forward_logits
+    else:
+        compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1656,11 +1660,13 @@ def main() -> None:
         log0(f"bigram_prior:loaded path:{args.bigram_prior_path}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    try:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    except Exception as e:
-        log0(f"torch.compile failed ({e}), using eager mode")
+    if args.model_type == "mamba_hybrid":
+        # Skip torch.compile for Mamba — einops rearrange breaks fullgraph=True
+        # (compilation is deferred to first forward call, so try/except won't catch it)
         compiled_model = base_model
+        log0("torch.compile:skipped (mamba_hybrid, einops incompatible with fullgraph)")
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
     if args.model_type == "mamba_hybrid":

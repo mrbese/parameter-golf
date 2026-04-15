@@ -391,8 +391,8 @@ class AttentionBlock(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = self._apply_rotary(q, cos, sin, self.rope_dims)
-        k = self._apply_rotary(k, cos, sin, self.rope_dims)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
 
         # FlashAttention or SDPA fallback
