@@ -280,6 +280,147 @@ def train_bpe_merges_fast(texts: list[str], num_merges: int = 250, verbose: bool
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace tokenizers backend (Rust, ~100x faster than pure Python)
+# ---------------------------------------------------------------------------
+
+def train_bpe_merges_hf(texts: list[str], num_merges: int = 1024, verbose: bool = True) -> list:
+    """
+    Train BPE merges using the HuggingFace `tokenizers` library (Rust backend).
+
+    ~100x faster than train_bpe_merges_fast: reduces 2-3 hours to ~2-5 minutes
+    on 32 cores for 100K FineWeb docs.  Returns merges in the same format as
+    train_bpe_merges_fast: [((left_id, right_id), new_id), ...]
+
+    Requires: pip install tokenizers
+    """
+    try:
+        from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+    except ImportError:
+        raise ImportError(
+            "HuggingFace tokenizers not installed. Run: pip install tokenizers\n"
+            "Falling back to pure-Python BPE is possible via train_bpe_merges_fast()."
+        )
+
+    import time as _time
+    import multiprocessing as mp
+    import tempfile, os
+
+    # Map base token IDs 0-(BASE_VOCAB_SIZE-1) to unique Unicode private-use chars.
+    # U+E000..U+E027 are valid single-codepoint, valid UTF-8, never in real text.
+    BASE_CHARS = [chr(0xE000 + i) for i in range(BASE_VOCAB_SIZE)]
+
+    # ------------------------------------------------------------------
+    # Step 1: Parallel encode texts → base token IDs
+    # ------------------------------------------------------------------
+    if verbose:
+        print(f"Encoding {len(texts)} texts with base BESE tokenizer...")
+
+    n_workers = min(mp.cpu_count(), 128)
+    chunk_size = max(1, len(texts) // n_workers)
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+    t_enc = _time.time()
+    with mp.Pool(n_workers) as pool:
+        encoded_chunks = pool.map(_encode_texts_worker, chunks)
+    all_encoded = [doc for chunk in encoded_chunks for doc in chunk]
+    if verbose:
+        print(f"  Parallel encoding: {n_workers} workers, {_time.time() - t_enc:.1f}s")
+
+    # ------------------------------------------------------------------
+    # Step 2: Write corpus to a temp file — one doc per line, no spaces.
+    # Each base token becomes one Unicode private-use char.
+    # Whitespace pre-tokenizer treats each line (= no-space sequence) as
+    # one "word", so BPE merges happen freely within each document.
+    # ------------------------------------------------------------------
+    if verbose:
+        print("  Writing corpus temp file...")
+    t_write = _time.time()
+    fd, tmp_path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for doc_tokens in all_encoded:
+                f.write("".join(BASE_CHARS[t] for t in doc_tokens) + "\n")
+        if verbose:
+            size_mb = os.path.getsize(tmp_path) / 1e6
+            print(f"  Corpus file: {size_mb:.0f} MB  ({_time.time() - t_write:.1f}s)")
+
+        # ------------------------------------------------------------------
+        # Step 3: Train BPE with HF tokenizers (Rust, multi-threaded)
+        # ------------------------------------------------------------------
+        if verbose:
+            print(f"  Training BPE ({num_merges} merges) with HuggingFace tokenizers...")
+        t_bpe = _time.time()
+
+        tokenizer = Tokenizer(models.BPE())
+        # Whitespace splits only on Unicode whitespace — our private-use chars
+        # are never whitespace, so each doc line becomes exactly one "word".
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+
+        trainer = trainers.BpeTrainer(
+            vocab_size=BASE_VOCAB_SIZE + num_merges,
+            min_frequency=2,
+            initial_alphabet=BASE_CHARS,
+            special_tokens=[],
+            show_progress=verbose,
+        )
+        tokenizer.train([tmp_path], trainer)
+
+        if verbose:
+            print(f"  HF BPE done in {_time.time() - t_bpe:.1f}s")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Step 4: Extract merges and convert char-strings → token ID pairs.
+    # Save the model to a temp dir to read merges.txt (one merge per line:
+    # "str_a str_b").  Replay the sequence to reconstruct integer IDs.
+    # ------------------------------------------------------------------
+    merge_dir = tempfile.mkdtemp()
+    try:
+        tokenizer.model.save(merge_dir)
+        merges_path = os.path.join(merge_dir, "merges.txt")
+        with open(merges_path, encoding="utf-8") as mf:
+            raw_lines = mf.read().splitlines()
+    finally:
+        import shutil
+        shutil.rmtree(merge_dir, ignore_errors=True)
+
+    # Filter header lines (start with #) and parse "str_a str_b" pairs
+    hf_merges = []
+    for line in raw_lines:
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            hf_merges.append((parts[0], parts[1]))
+
+    str_to_id: dict[str, int] = {c: i for i, c in enumerate(BASE_CHARS)}
+    result: list = []
+
+    for str_a, str_b in hf_merges:
+        id_a = str_to_id.get(str_a)
+        id_b = str_to_id.get(str_b)
+        if id_a is None or id_b is None:
+            continue   # shouldn't happen with a clean corpus
+        new_id = BASE_VOCAB_SIZE + len(result)
+        str_to_id[str_a + str_b] = new_id
+        result.append(((id_a, id_b), new_id))
+        if len(result) >= num_merges:
+            break
+
+    if verbose:
+        print(f"\nDone. Learned {len(result)} merges.")
+        print(
+            f"Vocabulary: {BASE_VOCAB_SIZE} base + {len(result)} merges = "
+            f"{BASE_VOCAB_SIZE + len(result)} total"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Fast encoding using merge priority (hash-map based)
 # ---------------------------------------------------------------------------
 

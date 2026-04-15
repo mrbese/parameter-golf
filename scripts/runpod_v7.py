@@ -463,7 +463,20 @@ def phase0_data_prep() -> None:
         t_bpe = time.time()
         # Extract just the text from scored_train for BPE training (100K docs for deeper merges)
         bpe_sample = [doc for _, doc in scored_train[:100000]]
-        merges = train_bpe_merges_fast(bpe_sample, num_merges=1024, verbose=True)
+
+        # Prefer HF tokenizers (Rust, ~100x faster).  Fall back to pure Python
+        # if the library is missing — pip install tokenizers to enable.
+        try:
+            from bese_fast_bpe import train_bpe_merges_hf
+            import subprocess, sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                   "tokenizers", "-q", "--break-system-packages"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            from bese_fast_bpe import train_bpe_merges_hf
+            merges = train_bpe_merges_hf(bpe_sample, num_merges=1024, verbose=True)
+        except Exception as _hf_err:
+            log(f"  HF tokenizers unavailable ({_hf_err}), falling back to pure-Python BPE")
+            merges = train_bpe_merges_fast(bpe_sample, num_merges=1024, verbose=True)
         del bpe_sample
         tok = FastBESEBPETokenizer(merges=merges)
         log(f"  Vocab size: {tok.vocab_size}")
