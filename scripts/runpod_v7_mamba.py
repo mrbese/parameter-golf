@@ -186,7 +186,8 @@ def extract_metrics(output: str) -> dict:
 def install_deps():
     banner("Installing dependencies")
     run_cmd([sys.executable, "-m", "pip", "install",
-             "mamba-ssm", "causal-conv1d", "einops", "--quiet", "--no-build-isolation"],
+             "mamba-ssm", "causal-conv1d", "einops",
+             "--quiet", "--no-build-isolation", "--break-system-packages"],
             label="pip-mamba-ssm")
 
 
