@@ -71,7 +71,7 @@ TRAIN_ENV = {
     "ADAM_WD": "0.095",
     "EMA_DECAY": "0.9965",
     "WARMDOWN_ITERS": "5000",
-    "TRAIN_SEQ_LEN": "4096",                # longer context — fused kernel is memory-efficient
+    "TRAIN_SEQ_LEN": "2048",                # 4096 OOMs after mamba-ssm compile fills VRAM
     "EVAL_SEQ_LEN": "2048",
     "EVAL_STRIDE": "64",
     "TOKENIZER_PATH": str(BPE_OUTPUT),
