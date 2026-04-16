@@ -49,8 +49,8 @@ TRAIN_ENV = {
     "MODEL_TYPE": "mamba_hybrid",
     "VOCAB_SIZE": "288",
     "NUM_LAYERS": "8",                       # 6 Mamba + 2 Attention = 8 layers
-    "MODEL_DIM": "512",
-    "MLP_MULT": "3.0",
+    "MODEL_DIM": "576",                      # wider (was 512) — width > depth for SSMs
+    "MLP_MULT": "3.5",                      # proven from v6.1
     "NUM_HEADS": "8",
     "NUM_KV_HEADS": "4",
     # Mamba-specific (informed by PR #1644 ablations)
