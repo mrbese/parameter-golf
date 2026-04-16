@@ -2186,10 +2186,12 @@ def main() -> None:
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
+        _sw_batch = 4 if args.model_type == "mamba_hybrid" else 32
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
+            batch_seqs=_sw_batch,
             eval_seq_len=sw_seq_len,
             ngram_tilt=_sw_ngram_tilt,
         )
@@ -2207,6 +2209,7 @@ def main() -> None:
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
+            batch_seqs=_sw_batch,
             eval_seq_len=sw_seq_len,
             ngram_tilt=_sw_ngram_tilt,
         )

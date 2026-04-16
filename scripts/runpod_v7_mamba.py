@@ -54,7 +54,7 @@ TRAIN_ENV = {
     "NUM_HEADS": "8",
     "NUM_KV_HEADS": "4",
     # Mamba-specific (informed by PR #1644 ablations)
-    "D_STATE": "64",                         # 128 OOMs in pure-PyTorch fallback (repeat_interleave expands B/C)
+    "D_STATE": "128",                        # VRAM peak was 32.5/81.5 GB with d_state=64, plenty of room
     "MAMBA_EXPAND": "2",
     "MAMBA_HEADDIM": "64",
     "MAMBA_CHUNK_SIZE": "64",
@@ -65,7 +65,7 @@ TRAIN_ENV = {
     "DEPTH_RECURRENCE_END": "0",
     "DEPTH_RECURRENCE_LOOPS": "1",
     "DEPTH_RECURRENCE_ACTIVATION_FRAC": "1.0",
-    # Training
+    # Training (tuned from v6.1 proven config)
     "QK_GAIN_INIT": "5.25",
     "MATRIX_LR": "0.026",
     "MUON_WD": "0.095",
