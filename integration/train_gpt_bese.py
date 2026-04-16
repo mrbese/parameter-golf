@@ -2186,7 +2186,7 @@ def main() -> None:
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
-        _sw_batch = 4 if args.model_type == "mamba_hybrid" else 32
+        _sw_batch = 2 if args.model_type == "mamba_hybrid" else 32
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
