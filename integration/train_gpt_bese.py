@@ -1661,10 +1661,10 @@ def main() -> None:
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     if args.model_type == "mamba_hybrid":
-        # fullgraph=False: einops.rearrange causes graph breaks, but the Triton
-        # kernel (mamba_chunk_scan_combined) provides the real speedup anyway
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-        log0("torch.compile:enabled (mamba_hybrid, fullgraph=False due to einops)")
+        # Skip torch.compile — Triton kernel (mamba_chunk_scan_combined) provides
+        # the real speedup; dynamo tracing with custom Triton ops causes hangs
+        compiled_model = base_model
+        log0("torch.compile:skipped (mamba_hybrid, Triton kernel is the fast path)")
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
