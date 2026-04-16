@@ -127,16 +127,30 @@ def banner(msg: str):
 def run_cmd(cmd, env=None, cwd=None, label="cmd", timeout=1800):
     full_env = {**os.environ, **(env or {})}
     log(f"\n  [{label}] Running: {' '.join(str(c) for c in cmd)}")
-    result = subprocess.run(
-        cmd, env=full_env, cwd=cwd,
-        capture_output=True, text=True, timeout=timeout,
+    t0 = time.time()
+    output_lines = []
+    proc = subprocess.Popen(
+        cmd, env=full_env, cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    combined = result.stdout + result.stderr
-    for line in combined.strip().split("\n"):
-        log(f"  [{label}] {line}")
-    if result.returncode != 0:
-        log(f"  [{label}] FAILED with return code {result.returncode}")
-    return combined
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if _LOG_FH:
+                _LOG_FH.write(line)
+                _LOG_FH.flush()
+            output_lines.append(line)
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(f"Command timed out after {timeout}s")
+    elapsed = time.time() - t0
+    if proc.returncode != 0:
+        log(f"  [{label}] FAILED (exit {proc.returncode}) after {elapsed:.1f}s")
+    else:
+        log(f"  [{label}] Completed in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+    return "".join(output_lines)
 
 def detect_gpus() -> int:
     try:
@@ -196,6 +210,7 @@ def phase1_training(num_gpus: int) -> str:
     env = TRAIN_ENV.copy()
     env["RUN_ID"] = "bese_v7_mamba"
     env["BESE_TOKENIZER_ROOT"] = str(BESE_DIR / "tokenizer")
+    env["PYTHONPATH"] = str(BESE_DIR)  # so `from integration.mamba3_ssd import ...` works
     env["VAL_LOSS_EVERY"] = "500"
     env["TRAIN_LOG_EVERY"] = "100"
 
