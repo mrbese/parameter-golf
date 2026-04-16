@@ -54,7 +54,7 @@ TRAIN_ENV = {
     "NUM_HEADS": "8",
     "NUM_KV_HEADS": "4",
     # Mamba-specific (informed by PR #1644 ablations)
-    "D_STATE": "128",                        # doubled from 64 — better state capacity
+    "D_STATE": "64",                         # 128 OOMs in pure-PyTorch fallback (repeat_interleave expands B/C)
     "MAMBA_EXPAND": "2",
     "MAMBA_HEADDIM": "64",
     "MAMBA_CHUNK_SIZE": "64",
