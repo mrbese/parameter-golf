@@ -1,10 +1,12 @@
 """
-Mamba-3 SSD (Structured State Space Duality) — Pure PyTorch implementation.
+Mamba-3 SSD (Structured State Space Duality) hybrid for Parameter Golf.
+
+Architecture: 6 Mamba-3 blocks + 2 Attention blocks (positions 2, 5).
+Uses fused Triton kernels from mamba-ssm when available, falls back to
+pure PyTorch (segsum/einsum) otherwise.
 
 Based on mamba3-minimal (https://github.com/VikramKarLex/mamba3-minimal).
-No custom CUDA/Triton kernels — uses standard PyTorch ops (einsum, cumsum, exp).
-
-For the Parameter Golf challenge: 7 Mamba + 1 Attention hybrid.
+Informed by PR #1644 (best Mamba-3 at 1.1473 BPB) and PR #1355 ablations.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Core SSD helpers
+# Core SSD helpers (pure PyTorch fallback)
 # ---------------------------------------------------------------------------
 
 def segsum(x: Tensor) -> Tensor:
@@ -59,13 +61,13 @@ def ssd_chunked(
     chunk_size: int,
     initial_states: Tensor | None = None,
 ) -> Tensor:
-    """Structured State Space Duality — chunked parallel computation.
+    """Structured State Space Duality — chunked parallel computation (fallback).
 
     Args:
         x: (batch, seq_len, heads, head_dim) — input after projection
         A: (batch, seq_len, heads) — log decay rates (dt * A_param)
-        B: (batch, seq_len, heads, d_state) — input-to-state projection
-        C: (batch, seq_len, heads, d_state) — state-to-output projection
+        B: (batch, seq_len, ngroups, d_state) — input-to-state projection
+        C: (batch, seq_len, ngroups, d_state) — state-to-output projection
         chunk_size: size of chunks for parallel computation
         initial_states: optional (batch, heads, head_dim, d_state) initial hidden state
 
@@ -73,7 +75,14 @@ def ssd_chunked(
         (batch, seq_len, heads, head_dim) output
     """
     batch, seq_len, nheads, headdim = x.shape
+    ngroups = B.shape[2]
     d_state = B.shape[-1]
+
+    # Broadcast B/C if ngroups < nheads
+    if ngroups < nheads:
+        repeat_factor = nheads // ngroups
+        B = B.repeat_interleave(repeat_factor, dim=2)  # (b, l, nheads, d_state)
+        C = C.repeat_interleave(repeat_factor, dim=2)
 
     # Pad sequence to multiple of chunk_size
     pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
@@ -93,40 +102,30 @@ def ssd_chunked(
     A = rearrange(A, "b c l h -> b h c l")
 
     # Step 1: Intra-chunk quadratic attention
-    # L[i,j] = exp(sum(A[j+1..i])) — decay from position j to position i within chunk
-    L = torch.exp(segsum(A))  # (batch, heads, n_chunks, chunk_size, chunk_size)
+    L = torch.exp(segsum(A))
 
-    # Y_diag = C^T @ L @ (B^T @ x) — within-chunk contribution
     Y_diag = torch.einsum(
         "bclhn, bcshn, bhcls, bcshp -> bclhp",
         C, B, L, x
     )
 
     # Step 2: Per-chunk state accumulation
-    A_cumsum = torch.cumsum(A, dim=-1)  # (batch, heads, n_chunks, chunk_size)
+    A_cumsum = torch.cumsum(A, dim=-1)
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
 
-    # Decay from each position to end of chunk
-    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)  # (b, h, c, l)
-
-    # Accumulate states: B^T @ (decay * x)
     states = torch.einsum(
         "bclhn, bhcl, bclhp -> bchpn",
         B, decay_states, x
-    )  # (batch, n_chunks, heads, head_dim, d_state)
+    )
 
-    # Step 3: Inter-chunk recurrence
-    # Propagate states across chunks with decay
+    # Step 3: Inter-chunk recurrence (with causality fix)
     if initial_states is not None:
-        # Prepend initial states
         states = torch.cat([initial_states.unsqueeze(1), states], dim=1)
 
-    A_chunk_decay = A_cumsum[:, :, :, -1]  # (b, h, c) — total decay per chunk
-    decay_chunk = torch.exp(segsum(F.pad(A_chunk_decay, (1, 0))))  # (b, h, c+1, c+1)
+    A_chunk_decay = A_cumsum[:, :, :, -1]
+    decay_chunk = torch.exp(segsum(F.pad(A_chunk_decay, (1, 0))))
 
     if initial_states is not None:
-        # With initial states: states has c+1 entries [h0, s0, s1, ..., s_{c-1}]
-        # We need new_states[z] = accumulated state ENTERING chunk z (from chunks 0..z-1)
-        # Shift columns by 1 so chunk z doesn't include its own state
         c_init = states.shape[1]
         new_states = torch.einsum(
             "bhzc, bchpn -> bzhpn",
@@ -134,9 +133,6 @@ def ssd_chunked(
             states
         )
     else:
-        # Without initial states: new_states[z] must only use states from chunks 0..z-1
-        # decay_chunk[:c, :c] is WRONG — diagonal is 1, so chunk z includes its own state
-        # Fix: shift columns by 1 → decay_chunk[:c, 1:c+1] gives strictly previous chunks
         c = states.shape[1]
         new_states = torch.einsum(
             "bhzc, bchpn -> bzhpn",
@@ -145,17 +141,15 @@ def ssd_chunked(
         )
 
     # Step 4: State-to-output
-    state_decay_out = torch.exp(A_cumsum)  # (b, h, c, l)
+    state_decay_out = torch.exp(A_cumsum)
     Y_off = torch.einsum(
         "bclhn, bchpn, bhcl -> bclhp",
         C, new_states, state_decay_out
     )
 
-    # Combine intra-chunk and inter-chunk
     Y = Y_diag + Y_off
     Y = rearrange(Y, "b c l h p -> b (c l) h p")
 
-    # Remove padding
     if pad_len > 0:
         Y = Y[:, :seq_len]
 
@@ -181,15 +175,19 @@ class Mamba3Block(nn.Module):
 
     Uses fused Triton kernels from mamba-ssm if available (2-3x faster),
     falls back to pure PyTorch (segsum/einsum) otherwise.
+
+    ngroups=1: all heads share B/C projections (matches reference Mamba-2,
+    confirmed optimal by PR #1644 ablations).
     """
 
     def __init__(
         self,
         dim: int,
-        d_state: int = 64,
+        d_state: int = 128,
         expand: int = 2,
         headdim: int = 64,
         chunk_size: int = 64,
+        ngroups: int = 1,
     ):
         super().__init__()
         self.dim = dim
@@ -198,34 +196,35 @@ class Mamba3Block(nn.Module):
         self.nheads = self.d_inner // headdim
         self.headdim = headdim
         self.chunk_size = chunk_size
+        self.ngroups = ngroups
 
         # Input projection: x → (z, x_proj, B, C, dt)
         # z: gating signal (d_inner)
         # x_proj: SSM input (d_inner)
-        # B: input-to-state (nheads * d_state)
-        # C: state-to-output (nheads * d_state)
+        # B: input-to-state (ngroups * d_state) — shared across heads
+        # C: state-to-output (ngroups * d_state) — shared across heads
         # dt: timestep (nheads)
-        d_proj = self.d_inner * 2 + self.nheads * d_state * 2 + self.nheads
+        d_proj = self.d_inner * 2 + ngroups * d_state * 2 + self.nheads
         self.in_proj = nn.Linear(dim, d_proj, bias=False)
         self.out_proj = nn.Linear(self.d_inner, dim, bias=False)
 
         # SSM parameters
         self.D = nn.Parameter(torch.ones(self.nheads))
         self.dt_bias = nn.Parameter(torch.randn(self.nheads) * 0.1)
-        self.A_log = nn.Parameter(torch.log(0.5 + torch.rand(self.nheads) * 0.5))  # log of decay rate
+        self.A_log = nn.Parameter(torch.log(0.5 + torch.rand(self.nheads) * 0.5))
 
         # Normalization for B and C projections
         self.B_norm = RMSNorm(d_state)
         self.C_norm = RMSNorm(d_state)
 
-        # Pre/post normalization
-        self.norm = nn.LayerNorm(dim)  # use existing RMSNorm pattern
+        # Pre-normalization
+        self.norm = nn.LayerNorm(dim)
 
         self._init_weights()
 
     def _init_weights(self):
         nn.init.orthogonal_(self.in_proj.weight, gain=1.0)
-        nn.init.zeros_(self.out_proj.weight)  # zero-init output projection
+        nn.init.zeros_(self.out_proj.weight)
 
     def forward(self, u: Tensor) -> Tensor:
         """
@@ -245,49 +244,52 @@ class Mamba3Block(nn.Module):
         # Split projections
         d_inner = self.d_inner
         nheads = self.nheads
+        ngroups = self.ngroups
         d_state = self.d_state
 
         z = proj[..., :d_inner]
         x = proj[..., d_inner:d_inner * 2]
-        B_flat = proj[..., d_inner * 2:d_inner * 2 + nheads * d_state]
-        C_flat = proj[..., d_inner * 2 + nheads * d_state:d_inner * 2 + nheads * d_state * 2]
+        B_flat = proj[..., d_inner * 2:d_inner * 2 + ngroups * d_state]
+        C_flat = proj[..., d_inner * 2 + ngroups * d_state:d_inner * 2 + ngroups * d_state * 2]
         dt = proj[..., -nheads:]
 
-        # Reshape B, C, x into multi-head form
-        B = rearrange(B_flat, "b l (h n) -> b l h n", h=nheads)
-        C = rearrange(C_flat, "b l (h n) -> b l h n", h=nheads)
+        # Reshape into multi-head/group form
+        B = B_flat.reshape(batch, seq_len, ngroups, d_state)
+        C = C_flat.reshape(batch, seq_len, ngroups, d_state)
         B = self.B_norm(B)
         C = self.C_norm(C)
-        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
-        z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+        x = x.reshape(batch, seq_len, nheads, self.headdim)
+        z = z.reshape(batch, seq_len, nheads, self.headdim)
 
         if _HAS_MAMBA_KERNEL:
             # Fused Triton kernel: handles softplus(dt+dt_bias), dt*A, chunking,
             # inter-chunk recurrence, D skip connection, SiLU gating — all in one kernel
-            A = -torch.exp(self.A_log.float())  # (nheads,) 1D
+            A = -torch.exp(self.A_log.float())  # (nheads,) 1D, negative
             y = mamba_chunk_scan_combined(
-                x, dt, A, B, C,
+                x.contiguous(),
+                dt.contiguous(),
+                A, B, C,
                 chunk_size=self.chunk_size,
                 D=self.D,
-                z=z,
+                z=z.contiguous(),
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
             )
         else:
             # Pure PyTorch fallback
-            dt = F.softplus(dt + self.dt_bias)
-            A = -torch.exp(self.A_log)
-            dA = dt * A
+            dt_proc = F.softplus(dt + self.dt_bias)
+            A = -torch.exp(self.A_log.float())
+            dA = dt_proc * A
             y = ssd_chunked(x, dA, B, C, self.chunk_size)
             y = y + x * self.D[None, None, :, None]
-            # Un-reshape z for element-wise gating
-            y = rearrange(y, "b l h p -> b l (h p)")
-            z_flat = rearrange(z, "b l h p -> b l (h p)")
+            # Merge heads, gate with SiLU, output
+            y = y.reshape(batch, seq_len, d_inner)
+            z_flat = z.reshape(batch, seq_len, d_inner)
             y = y * F.silu(z_flat)
             return u + self.out_proj(y)
 
-        # Merge heads and output projection
-        y = rearrange(y, "b l h p -> b l (h p)")
+        # Merge heads and output projection (kernel path)
+        y = y.reshape(batch, seq_len, d_inner)
         return u + self.out_proj(y)
 
 
@@ -296,7 +298,7 @@ class Mamba3Block(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Rotary(nn.Module):
-    """RoPE (Rotary Position Embedding). Copied from train_gpt_bese.py to avoid circular import."""
+    """RoPE (Rotary Position Embedding)."""
     def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 1024, rope_dims: int = 0):
         super().__init__()
         self.dim = dim
@@ -308,6 +310,7 @@ class Rotary(nn.Module):
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
         self._sin_cached: Tensor | None = None
+
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         if (
             self._cos_cached is None
@@ -331,7 +334,7 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
-    """Apply rotary position embeddings. Copied from train_gpt_bese.py."""
+    """Apply rotary position embeddings."""
     if rope_dims > 0 and rope_dims < x.size(-1):
         x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
         half = rope_dims // 2
@@ -344,11 +347,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
 
 
 class AttentionBlock(nn.Module):
-    """Standard causal self-attention block for the hybrid architecture.
-
-    Simplified from the existing GPT's bank-based attention to standalone weights.
-    Uses FlashAttention-3 if available, falls back to SDPA.
-    """
+    """Standard causal self-attention block for the hybrid architecture."""
 
     def __init__(
         self,
@@ -367,24 +366,19 @@ class AttentionBlock(nn.Module):
         self.head_dim = dim // num_heads
         mlp_dim = int(dim * mlp_mult)
 
-        # Attention projections
         self.c_q = nn.Linear(dim, dim, bias=False)
         self.c_k = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
         self.c_v = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
         self.c_proj = nn.Linear(dim, dim, bias=False)
 
-        # MLP
         self.mlp_fc = nn.Linear(dim, mlp_dim, bias=False)
         self.mlp_proj = nn.Linear(mlp_dim, dim, bias=False)
 
-        # QK gain
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
 
-        # RoPE (using local Rotary to avoid circular import)
         self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=4096, rope_dims=rope_dims)
 
-        # Layer norms
         self.attn_norm = nn.LayerNorm(dim)
         self.mlp_norm = nn.LayerNorm(dim)
 
@@ -394,20 +388,18 @@ class AttentionBlock(nn.Module):
         for name, p in self.named_parameters():
             if p.ndim == 2:
                 if "proj" in name:
-                    nn.init.zeros_(p)  # zero-init output projections
+                    nn.init.zeros_(p)
                 else:
                     nn.init.orthogonal_(p, gain=1.0)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
 
-        # Attention
         h = self.attn_norm(x)
         q = self.c_q(h).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # QK norm + RoPE
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -415,14 +407,11 @@ class AttentionBlock(nn.Module):
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
 
-        # FlashAttention or SDPA fallback
         try:
             from flash_attn_interface import flash_attn_func as fa3
             y = fa3(q, k, v, causal=True)
         except ImportError:
-            # SDPA fallback
-            q_t = q.transpose(1, 2)  # (bsz, heads, seqlen, head_dim)
-            # Expand KV for GQA
+            q_t = q.transpose(1, 2)
             rep = self.num_heads // self.num_kv_heads
             k_t = k.transpose(1, 2).repeat_interleave(rep, dim=1)
             v_t = v.transpose(1, 2).repeat_interleave(rep, dim=1)
@@ -432,7 +421,6 @@ class AttentionBlock(nn.Module):
         y = y.reshape(bsz, seqlen, dim)
         x = x + self.c_proj(y)
 
-        # MLP
         h = self.mlp_norm(x)
         x = x + self.mlp_proj(F.silu(self.mlp_fc(h)))
 
@@ -440,16 +428,16 @@ class AttentionBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Hybrid Model: 7 Mamba-3 + 1 Attention
+# Hybrid Model: 6 Mamba-3 + 2 Attention
 # ---------------------------------------------------------------------------
 
 class HybridMambaGPT(nn.Module):
     """Mamba-3 + Attention hybrid for Parameter Golf.
 
     Architecture:
-        - 7 Mamba-3 blocks (linear O(n) scaling)
-        - 1 Attention block at position `attn_pos` (quadratic, but only 1 layer)
-        - Depth recurrence on configurable Mamba layers
+        - 6 Mamba-3 blocks (linear O(n) scaling, ngroups=1)
+        - 2 Attention blocks at configurable positions (default: 2, 5)
+        - No depth recurrence (hurts SSMs by -69 mBPB per PR #1355)
         - BESE 288 vocab with tied embeddings
     """
 
@@ -458,11 +446,11 @@ class HybridMambaGPT(nn.Module):
         vocab_size: int = 288,
         num_layers: int = 8,
         model_dim: int = 512,
-        d_state: int = 64,
+        d_state: int = 128,
         expand: int = 2,
         headdim: int = 64,
         chunk_size: int = 64,
-        attn_pos: int = 4,
+        attn_pos: int | list[int] = None,
         num_heads: int = 8,
         num_kv_heads: int = 4,
         mlp_mult: float = 3.0,
@@ -471,10 +459,12 @@ class HybridMambaGPT(nn.Module):
         rope_dims: int = 16,
         logit_softcap: float = 30.0,
         tied_embed_init_std: float = 0.005,
-        depth_recurrence_start: int = 2,
-        depth_recurrence_end: int = 4,
-        depth_recurrence_loops: int = 3,
-        depth_recurrence_activation_frac: float = 0.35,
+        ngroups: int = 1,
+        # Legacy depth recurrence params (kept for API compat, but disabled)
+        depth_recurrence_start: int = 0,
+        depth_recurrence_end: int = 0,
+        depth_recurrence_loops: int = 1,
+        depth_recurrence_activation_frac: float = 1.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -482,14 +472,23 @@ class HybridMambaGPT(nn.Module):
         self.num_layers = num_layers
         self.logit_softcap = logit_softcap
         self.tied_embed_init_std = tied_embed_init_std
-        self.attn_pos = attn_pos
 
-        # Depth recurrence config
+        # Attention positions: default [2, 5] for 8-layer model
+        if attn_pos is None:
+            self.attn_positions = [2, 5]
+        elif isinstance(attn_pos, int):
+            self.attn_positions = [attn_pos]
+        else:
+            self.attn_positions = list(attn_pos)
+        # Legacy single attn_pos for training script compat
+        self.attn_pos = self.attn_positions[0]
+
+        # Depth recurrence config (kept for API compat, defaults to disabled)
         self._rec_start = depth_recurrence_start
         self._rec_end = depth_recurrence_end
         self._rec_target_loops = depth_recurrence_loops
         self._rec_activation_frac = depth_recurrence_activation_frac
-        self._rec_loops = 1  # starts at 1, increases during training
+        self._rec_loops = 1
         self._training_progress = 0.0
 
         # Token embedding (tied with lm_head)
@@ -499,10 +498,10 @@ class HybridMambaGPT(nn.Module):
         # SmearGate for temporal smoothing
         self.smear_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
 
-        # Build layers
+        # Build layers: Mamba at most positions, Attention at attn_positions
         self.layers = nn.ModuleList()
         for i in range(num_layers):
-            if i == attn_pos:
+            if i in self.attn_positions:
                 self.layers.append(AttentionBlock(
                     dim=model_dim,
                     num_heads=num_heads,
@@ -519,6 +518,7 @@ class HybridMambaGPT(nn.Module):
                     expand=expand,
                     headdim=headdim,
                     chunk_size=chunk_size,
+                    ngroups=ngroups,
                 ))
 
         # Final norm
@@ -534,14 +534,13 @@ class HybridMambaGPT(nn.Module):
         return (1 - g) * x + g * x_prev
 
     def _run_layers(self, x: Tensor) -> Tensor:
-        """Run all layers with optional depth recurrence on Mamba layers."""
-        # Determine number of recurrence loops
+        """Run all layers sequentially (no depth recurrence for SSMs)."""
+        # Depth recurrence support (disabled by default for Mamba)
         if self._training_progress >= self._rec_activation_frac:
             self._rec_loops = self._rec_target_loops
 
         for i, layer in enumerate(self.layers):
             if self._rec_start <= i <= self._rec_end and self._rec_loops > 1:
-                # Depth recurrence: loop this layer multiple times
                 for _ in range(self._rec_loops):
                     x = layer(x)
             else:

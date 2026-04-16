@@ -11,6 +11,12 @@ import sys
 import time
 import uuid
 from pathlib import Path
+
+# Fix Triton JIT cache race under torchrun: give each rank its own cache dir.
+# Must be set BEFORE any Triton import (mamba-ssm triggers Triton on import).
+_local_rank = os.environ.get("LOCAL_RANK", "0")
+os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/triton_cache_rank{_local_rank}")
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -130,11 +136,14 @@ class Hyperparameters:
 
     # v7: Mamba-3 hybrid
     model_type = os.environ.get("MODEL_TYPE", "transformer")
-    d_state = int(os.environ.get("D_STATE", 64))
+    d_state = int(os.environ.get("D_STATE", 128))
     mamba_expand = int(os.environ.get("MAMBA_EXPAND", 2))
     mamba_headdim = int(os.environ.get("MAMBA_HEADDIM", 64))
     mamba_chunk_size = int(os.environ.get("MAMBA_CHUNK_SIZE", 64))
-    attn_layer_pos = int(os.environ.get("ATTN_LAYER_POS", 4))
+    mamba_ngroups = int(os.environ.get("MAMBA_NGROUPS", 1))
+    # ATTN_LAYER_POS: single int or comma-separated list (e.g. "2,5")
+    _attn_pos_raw = os.environ.get("ATTN_LAYER_POS", "2,5")
+    attn_layer_pos = [int(x) for x in _attn_pos_raw.split(",")] if "," in _attn_pos_raw else int(_attn_pos_raw)
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1608,6 +1617,7 @@ def main() -> None:
             rope_dims=args.rope_dims,
             logit_softcap=args.logit_softcap,
             tied_embed_init_std=args.tied_embed_init_std,
+            ngroups=args.mamba_ngroups,
             depth_recurrence_start=args.depth_recurrence_start,
             depth_recurrence_end=args.depth_recurrence_end,
             depth_recurrence_loops=args.depth_recurrence_loops,
@@ -1797,7 +1807,7 @@ def main() -> None:
         xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
         log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     else:
-        log0(f"model_type:mamba_hybrid d_state:{args.d_state} expand:{args.mamba_expand} attn_pos:{args.attn_layer_pos}")
+        log0(f"model_type:mamba_hybrid d_state:{args.d_state} expand:{args.mamba_expand} ngroups:{args.mamba_ngroups} attn_pos:{args.attn_layer_pos}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -2105,6 +2115,7 @@ def main() -> None:
             rope_dims=args.rope_dims,
             logit_softcap=args.logit_softcap,
             tied_embed_init_std=args.tied_embed_init_std,
+            ngroups=args.mamba_ngroups,
             depth_recurrence_start=args.depth_recurrence_start,
             depth_recurrence_end=args.depth_recurrence_end,
             depth_recurrence_loops=args.depth_recurrence_loops,

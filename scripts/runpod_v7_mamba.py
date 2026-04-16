@@ -46,24 +46,25 @@ LOGFILE = NET_VOL / "logs" / "run_v7_mamba.log"
 # ---------------------------------------------------------------------------
 TRAIN_ENV = {
     # Model architecture
-    "MODEL_TYPE": "mamba_hybrid",           # NEW: tells training script to use HybridMambaGPT
+    "MODEL_TYPE": "mamba_hybrid",
     "VOCAB_SIZE": "288",
-    "NUM_LAYERS": "8",                       # 7 Mamba + 1 Attention = 8 physical layers
+    "NUM_LAYERS": "8",                       # 6 Mamba + 2 Attention = 8 layers
     "MODEL_DIM": "512",
-    "MLP_MULT": "3.0",                      # for the attention layer's MLP
-    "NUM_HEADS": "8",                        # for the attention layer
-    "NUM_KV_HEADS": "4",                     # for the attention layer
-    # Mamba-specific
-    "D_STATE": "64",
+    "MLP_MULT": "3.0",
+    "NUM_HEADS": "8",
+    "NUM_KV_HEADS": "4",
+    # Mamba-specific (informed by PR #1644 ablations)
+    "D_STATE": "128",                        # doubled from 64 — better state capacity
     "MAMBA_EXPAND": "2",
     "MAMBA_HEADDIM": "64",
     "MAMBA_CHUNK_SIZE": "64",
-    "ATTN_LAYER_POS": "4",                  # attention layer at position 4 (middle)
-    # Depth recurrence on Mamba layers 2-4
-    "DEPTH_RECURRENCE_START": "2",
-    "DEPTH_RECURRENCE_END": "4",
-    "DEPTH_RECURRENCE_LOOPS": "3",
-    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "0.35",
+    "MAMBA_NGROUPS": "1",                    # shared B/C across heads (reference default)
+    "ATTN_LAYER_POS": "2,5",                # 2 attention layers at positions 2 and 5
+    # Depth recurrence DISABLED (hurts SSMs by -69 mBPB per PR #1355)
+    "DEPTH_RECURRENCE_START": "0",
+    "DEPTH_RECURRENCE_END": "0",
+    "DEPTH_RECURRENCE_LOOPS": "1",
+    "DEPTH_RECURRENCE_ACTIVATION_FRAC": "1.0",
     # Training
     "QK_GAIN_INIT": "5.25",
     "MATRIX_LR": "0.026",
@@ -71,7 +72,7 @@ TRAIN_ENV = {
     "ADAM_WD": "0.095",
     "EMA_DECAY": "0.9965",
     "WARMDOWN_ITERS": "5000",
-    "TRAIN_SEQ_LEN": "2048",                # 4096 OOMs after mamba-ssm compile fills VRAM
+    "TRAIN_SEQ_LEN": "2048",
     "EVAL_SEQ_LEN": "2048",
     "EVAL_STRIDE": "64",
     "TOKENIZER_PATH": str(BPE_OUTPUT),
