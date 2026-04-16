@@ -71,7 +71,7 @@ TRAIN_ENV = {
     "ADAM_WD": "0.095",
     "EMA_DECAY": "0.9965",
     "WARMDOWN_ITERS": "5000",
-    "TRAIN_SEQ_LEN": "2048",                # match transformer; 4096 maxes VRAM at 99%
+    "TRAIN_SEQ_LEN": "4096",                # longer context — fused kernel is memory-efficient
     "EVAL_SEQ_LEN": "2048",
     "EVAL_STRIDE": "64",
     "TOKENIZER_PATH": str(BPE_OUTPUT),
@@ -86,8 +86,8 @@ TRAIN_ENV = {
     "NOISY_QAT_ENABLED": "0",
     "BIGRAM_PRIOR_ENABLED": "0",
     "LATE_QAT_THRESHOLD": "0",
-    # TTT
-    "TTT_ENABLED": "1",
+    # TTT (disabled — too slow, saves credits)
+    "TTT_ENABLED": "0",
     "TTT_LR": "0.005",
     "TTT_MOMENTUM": "0.9",
     "TTT_EPOCHS": "1",
@@ -181,12 +181,13 @@ def extract_metrics(output: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Pre-flight: install einops
+# Pre-flight: install deps (mamba-ssm for Triton kernels, einops for fallback)
 # ---------------------------------------------------------------------------
 def install_deps():
     banner("Installing dependencies")
-    run_cmd([sys.executable, "-m", "pip", "install", "einops", "--quiet"],
-            label="pip-einops")
+    run_cmd([sys.executable, "-m", "pip", "install",
+             "mamba-ssm", "causal-conv1d", "einops", "--quiet", "--no-build-isolation"],
+            label="pip-mamba-ssm")
 
 
 # ---------------------------------------------------------------------------

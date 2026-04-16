@@ -18,6 +18,13 @@ try:
 except ImportError:
     raise ImportError("einops is required: pip install einops")
 
+# Try to import the fused Triton kernel from mamba-ssm (2-3x faster than pure PyTorch)
+try:
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    _HAS_MAMBA_KERNEL = True
+except ImportError:
+    _HAS_MAMBA_KERNEL = False
+
 
 # ---------------------------------------------------------------------------
 # Core SSD helpers
@@ -172,8 +179,8 @@ class RMSNorm(nn.Module):
 class Mamba3Block(nn.Module):
     """Mamba-3 block with SSD (Structured State Space Duality).
 
-    Uses trapezoidal discretization decomposed into two SSD calls,
-    implemented in pure PyTorch without custom CUDA kernels.
+    Uses fused Triton kernels from mamba-ssm if available (2-3x faster),
+    falls back to pure PyTorch (segsum/einsum) otherwise.
     """
 
     def __init__(
@@ -246,35 +253,41 @@ class Mamba3Block(nn.Module):
         C_flat = proj[..., d_inner * 2 + nheads * d_state:d_inner * 2 + nheads * d_state * 2]
         dt = proj[..., -nheads:]
 
-        # Process dt (timestep)
-        dt = F.softplus(dt + self.dt_bias)  # (batch, seq_len, nheads)
-
-        # Compute dA = dt * A (log-space decay)
-        A = -torch.exp(self.A_log)  # negative decay rate
-        dA = dt * A  # (batch, seq_len, nheads)
-
-        # Normalize B and C
+        # Reshape B, C, x into multi-head form
         B = rearrange(B_flat, "b l (h n) -> b l h n", h=nheads)
         C = rearrange(C_flat, "b l (h n) -> b l h n", h=nheads)
         B = self.B_norm(B)
         C = self.C_norm(C)
-
-        # Reshape x for SSD
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+        z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
 
-        # Run SSD
-        y = ssd_chunked(x, dA, B, C, self.chunk_size)
+        if _HAS_MAMBA_KERNEL:
+            # Fused Triton kernel: handles softplus(dt+dt_bias), dt*A, chunking,
+            # inter-chunk recurrence, D skip connection, SiLU gating — all in one kernel
+            A = -torch.exp(self.A_log.float())  # (nheads,) 1D
+            y = mamba_chunk_scan_combined(
+                x, dt, A, B, C,
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=z,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+            )
+        else:
+            # Pure PyTorch fallback
+            dt = F.softplus(dt + self.dt_bias)
+            A = -torch.exp(self.A_log)
+            dA = dt * A
+            y = ssd_chunked(x, dA, B, C, self.chunk_size)
+            y = y + x * self.D[None, None, :, None]
+            # Un-reshape z for element-wise gating
+            y = rearrange(y, "b l h p -> b l (h p)")
+            z_flat = rearrange(z, "b l h p -> b l (h p)")
+            y = y * F.silu(z_flat)
+            return u + self.out_proj(y)
 
-        # Skip connection with D
-        y = y + x * self.D[None, None, :, None]
-
-        # Merge heads
+        # Merge heads and output projection
         y = rearrange(y, "b l h p -> b l (h p)")
-
-        # Gate with SiLU
-        y = y * F.silu(z)
-
-        # Output projection + residual
         return u + self.out_proj(y)
 
 
