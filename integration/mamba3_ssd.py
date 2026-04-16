@@ -20,12 +20,10 @@ try:
 except ImportError:
     raise ImportError("einops is required: pip install einops")
 
-# Try to import the fused Triton kernel from mamba-ssm (2-3x faster than pure PyTorch)
-try:
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-    _HAS_MAMBA_KERNEL = True
-except ImportError:
-    _HAS_MAMBA_KERNEL = False
+# Fused Triton kernel from mamba-ssm — disabled due to multi-GPU segfault after ~100 steps.
+# The pure PyTorch fallback (ngroups=1, d_state=128) with the new architecture should
+# still be faster than v7 v1 (ngroups=16, d_state=64) due to fewer params + no depth recurrence.
+_HAS_MAMBA_KERNEL = False
 
 
 # ---------------------------------------------------------------------------
