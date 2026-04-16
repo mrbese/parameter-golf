@@ -71,8 +71,8 @@ TRAIN_ENV = {
     "ADAM_WD": "0.095",
     "EMA_DECAY": "0.9965",
     "WARMDOWN_ITERS": "5000",
-    "TRAIN_SEQ_LEN": "4096",                # longer context — Mamba handles it in O(n)
-    "EVAL_SEQ_LEN": "2048",                 # keep eval at 2048 for comparison
+    "TRAIN_SEQ_LEN": "2048",                # match transformer; 4096 maxes VRAM at 99%
+    "EVAL_SEQ_LEN": "2048",
     "EVAL_STRIDE": "64",
     "TOKENIZER_PATH": str(BPE_OUTPUT),
     "DATA_PATH": str(SHARD_DIR),

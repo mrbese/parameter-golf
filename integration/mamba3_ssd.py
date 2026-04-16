@@ -117,16 +117,23 @@ def ssd_chunked(
     decay_chunk = torch.exp(segsum(F.pad(A_chunk_decay, (1, 0))))  # (b, h, c+1, c+1)
 
     if initial_states is not None:
+        # With initial states: states has c+1 entries [h0, s0, s1, ..., s_{c-1}]
+        # We need new_states[z] = accumulated state ENTERING chunk z (from chunks 0..z-1)
+        # Shift columns by 1 so chunk z doesn't include its own state
+        c_init = states.shape[1]
         new_states = torch.einsum(
             "bhzc, bchpn -> bzhpn",
-            decay_chunk[:, :, :states.shape[1], :states.shape[1]],
+            decay_chunk[:, :, 1:c_init + 1, :c_init],
             states
         )
-        new_states = new_states[:, 1:]  # remove the initial state position
     else:
+        # Without initial states: new_states[z] must only use states from chunks 0..z-1
+        # decay_chunk[:c, :c] is WRONG — diagonal is 1, so chunk z includes its own state
+        # Fix: shift columns by 1 → decay_chunk[:c, 1:c+1] gives strictly previous chunks
+        c = states.shape[1]
         new_states = torch.einsum(
             "bhzc, bchpn -> bzhpn",
-            decay_chunk[:, :, :states.shape[1], :states.shape[1]],
+            decay_chunk[:, :, :c, 1:c + 1],
             states
         )
 
