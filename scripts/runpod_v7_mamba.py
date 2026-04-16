@@ -3,7 +3,7 @@
 RunPod v7-mamba: Mamba-3 + Attention hybrid for Parameter Golf.
 
 Non-record submission for the unlimited compute track.
-Architecture: 7 Mamba-3 blocks + 1 Attention block, BESE 288 vocab.
+Architecture: 6 Mamba-3 blocks + 2 Attention blocks (pos 2,5), BESE 288 vocab.
 Thesis: BESE's 2x token density is an advantage with O(n) SSMs.
 
 Uses existing v5/v6 shards and tokenizer — no data prep needed.
@@ -251,7 +251,7 @@ def main():
 
     banner("BESE v7-mamba: Mamba-3 + Attention Hybrid")
     log(f"  Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    log(f"  Architecture: 7 Mamba-3 + 1 Attention, dim=512, BESE 288 vocab")
+    log(f"  Architecture: 6 Mamba-3 + 2 Attention (pos 2,5), dim=512, d_state=128, ngroups=1, BESE 288 vocab")
     log(f"  Thesis: BESE's 2x token density is an advantage with O(n) SSMs")
 
     # Install deps
