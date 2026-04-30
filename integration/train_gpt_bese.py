@@ -1635,8 +1635,13 @@ def main() -> None:
     # --- Tokenizer loading: SentencePiece (.model) or BESE BPE (.json) ---
     _use_bese = args.tokenizer_path.endswith(".json")
     if _use_bese:
-        from bese_fast_bpe import FastBESEBPETokenizer
-        bese_tok = FastBESEBPETokenizer.load(args.tokenizer_path)
+        _bese_variant = os.environ.get("BESE_TOKENIZER_VARIANT", "v1").lower()
+        if _bese_variant == "v3":
+            from bese_v3_fast_bpe import BeseV3FastBPE
+            bese_tok = BeseV3FastBPE.load(args.tokenizer_path)
+        else:
+            from bese_fast_bpe import FastBESEBPETokenizer
+            bese_tok = FastBESEBPETokenizer.load(args.tokenizer_path)
         if bese_tok.vocab_size != args.vocab_size:
             raise ValueError(
                 f"VOCAB_SIZE={args.vocab_size} does not match BESE vocab_size={bese_tok.vocab_size}"

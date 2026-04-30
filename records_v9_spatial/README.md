@@ -213,7 +213,7 @@ If you want to re-derive the v3 coordinates and re-encode the FineWeb shards:
 git clone https://github.com/mrbese/parameter-golf-bese.git bese
 cd bese
 git checkout v9-spatial
-pip install einops --break-system-packages
+pip install einops datasets --break-system-packages
 python scripts/runpod_v9_spatial.py --num-gpus 8
 ```
 

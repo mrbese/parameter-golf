@@ -510,12 +510,22 @@ def phase0d_build_ngram() -> None:
         log(f"  n-gram table already exists: {NGRAM_TABLE}")
         return
     banner("PHASE 0d: Build n-gram tilt table")
+    # build_ngram_table.py takes a single shard file (not a directory) and
+    # has no --vocab-size flag — it scans whatever IDs are in the shard.
+    train_shards = sorted(SHARD_DIR.glob("fineweb_train_*.bin"))
+    if not train_shards:
+        raise RuntimeError(
+            f"No fineweb_train_*.bin shards in {SHARD_DIR}; "
+            "Phase 0c must run before Phase 0d."
+        )
+    shard_for_ngram = train_shards[0]
+    log(f"  Scanning {shard_for_ngram.name} for n-grams (n=2..3)")
     cmd = [
         "python", str(BESE_DIR / "scripts" / "build_ngram_table.py"),
-        "--shard-dir", str(SHARD_DIR),
+        "--shard", str(shard_for_ngram),
         "--output", str(NGRAM_TABLE),
-        "--vocab-size", "288",
         "--max-n", "3",
+        "--top-k", "1",
     ]
     run_cmd(cmd, label="ngram", timeout=2400)
 

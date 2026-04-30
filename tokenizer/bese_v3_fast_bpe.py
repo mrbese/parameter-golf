@@ -473,6 +473,34 @@ class BeseV3FastBPE:
         """Map letter -> base token id (for embedding init)."""
         return {ch: LETTER_START + i for i, ch in enumerate(LETTERS)}
 
+    def build_luts_for_training(self, device=None):
+        """LUTs the train_gpt_bese.py eval_val function expects.
+
+        Returns (base_bytes, has_leading_space, is_boundary):
+          - base_bytes[t]   = UTF-8 byte count for token t (matches the
+                              byte invariant used everywhere else in v3).
+          - has_leading_space[t] = always False. v3 has an explicit SPACE
+                              token (id=30); spaces never get folded into
+                              another token's textual form, so the SP-style
+                              "leading space" flag does not apply. Mirrors
+                              v1 BESE behaviour.
+          - is_boundary[t]  = True only for PAD/BOS/EOS/UNK. Used to mask
+                              out boundary tokens in the byte-counting
+                              accumulator during BPB eval.
+        """
+        import torch
+        bpt = self.compute_bytes_per_token()
+        has_leading_space = np.zeros(self.vocab_size, dtype=np.bool_)
+        is_boundary = np.zeros(self.vocab_size, dtype=np.bool_)
+        for tid in (PAD_ID, BOS_ID, EOS_ID, UNK_ID):
+            is_boundary[tid] = True
+        kwargs = {"device": device} if device is not None else {}
+        return (
+            torch.tensor(bpt.copy(), dtype=torch.int16, **kwargs),
+            torch.tensor(has_leading_space, dtype=torch.bool, **kwargs),
+            torch.tensor(is_boundary, dtype=torch.bool, **kwargs),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Self-test
