@@ -1,25 +1,37 @@
 {
-  "name": "BESE v3 — Spatial Letter Encoding",
   "track": "non_record_16mb",
+  "date": "2026-04-30",
+  "name": "BESE v3 — Spatial Letter Encoding",
   "author": "Omer Bese",
   "github_id": "mrbese",
-  "val_bpb": null,
-  "date": "2026-04-30",
   "summary": "Novel byte-level tokenizer where every English letter has a 3D coordinate derived from FineWeb bigram MDS. The same coordinates do double duty: spatial-scored BPE merge selection (score = freq * exp(-d / 3sigma) ** 0.02) AND embedding-table init (first 12 dims of each letter row). First submission to use one geometric prior across both tokenizer and model init. Architecture identical to PR #1666 — only the tokenizer + embedding init change.",
+
+  "val_bpb": null,
+  "val_loss": null,
+  "pre_quant_val_bpb": null,
+  "pre_quant_val_loss": null,
+
+  "bytes_total": null,
+  "bytes_model": null,
+  "bytes_code": null,
+
+  "step_stop": null,
+  "wallclock_seconds": 600,
   "hardware": "8xH100 80GB SXM",
-  "training_time_seconds": 600,
-  "compressed_model_bytes": null,
-  "code_bytes": null,
-  "total_artifact_bytes": null,
+
   "vocab_size": 288,
   "num_layers": 12,
   "model_dim": 512,
   "mlp_mult": 3.5,
+  "num_heads": 8,
+  "num_kv_heads": 4,
+
   "tokenizer": "BESE v3 spatial (47 base + 241 BPE = 288 vocab)",
-  "architecture": "Transformer with depth recurrence (layers 3-5, 3 loops), parallel residuals (layer 8+)",
-  "quantization": "INT6 mixed clipping",
+  "architecture": "Transformer with depth recurrence (layers 3-5, 3 loops), parallel residuals (layer 8+), QK-gain 5.25",
+  "quantization": "INT6 mixed clipping (per category)",
   "compression": "LZMA preset 9",
   "evaluation": "INT6 + sliding window (stride 64) + n-gram tilt + score-first TTT",
+
   "spatial_init": {
     "enabled": true,
     "path": "letter_coords_v3.json",
@@ -33,6 +45,7 @@
     "centroid_for_merges": true,
     "fallback_to_freq": "for pairs where either token has no spatial coord (special, punct, digit, or merges thereof)"
   },
+
   "v3_vs_v2_control": {
     "v2_pr": "https://github.com/openai/parameter-golf/pull/1666",
     "v2_score": 1.1531,
@@ -40,5 +53,6 @@
     "v2_std": 0.0028,
     "delta_attribution": "Architecture, optimizer, quantization, eval pipeline are identical between v2 and v3. Any BPB delta is attributable to tokenizer + embedding init only."
   },
+
   "notes": "Single-seed non-record submission. Submitted under the rule that allows in-progress / novel-idea work. Three-seed validation, Turkish-corpus comparative test, and higher-vocab variants are pending compute credits (see README Ongoing Work section). Prep is untimed: ~30-50 min for coord optimization + BPE training + shard re-encoding + ngram table; Phase 1 training is the standard 600s cap on 8xH100 SXM."
 }

@@ -195,6 +195,8 @@ pip install einops sentencepiece
 python ../../../data/cached_challenge_fineweb.py --variant sp1024
 
 # Run training + eval directly:
+BESE_TOKENIZER_VARIANT=v3 \
+BESE_TOKENIZER_ROOT=. \
 SPATIAL_INIT_ENABLED=1 \
 SPATIAL_INIT_PATH=./letter_coords_v3.json \
 SPATIAL_INIT_DIMS=12 \
@@ -204,6 +206,8 @@ DATA_PATH=../../../data/datasets/fineweb10B_v3_spatial/ \
 RUN_ID=v3_spatial_repro \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
+
+`BESE_TOKENIZER_VARIANT=v3` switches the trainer's tokenizer dispatch to load `BeseV3FastBPE` (47-token flat alphabet + 241 BPE merges) instead of the v1 `FastBESEBPETokenizer` (40-token group/position layout). `BESE_TOKENIZER_ROOT=.` adds this folder to `sys.path` so `bese_v3_fast_bpe.py` and `bese_v3_constants.py` can be imported.
 
 ### Full pipeline — rebuild from scratch
 
