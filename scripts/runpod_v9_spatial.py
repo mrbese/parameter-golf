@@ -58,7 +58,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths (network volume for persistence; pod-local for code)
 # ---------------------------------------------------------------------------
-NET_VOL = Path("/runpod-volume")
+# NET_VOL defaults to the RunPod network volume mount; override to
+# /workspace (or any pod-local path) when running on a pod without a
+# network volume attached, e.g., when the 8xH100 SXM you grabbed is in
+# a region different from your existing volume.
+#   NET_VOL=/workspace python scripts/runpod_v9_spatial.py ...
+NET_VOL = Path(os.environ.get("NET_VOL", "/runpod-volume"))
 BESE_DIR = Path(os.environ.get("BESE_DIR", "/workspace/bese"))
 WORK_DIR = Path("/workspace")
 PG_DIR = Path(os.environ.get("PG_DIR", "/workspace/parameter-golf"))
