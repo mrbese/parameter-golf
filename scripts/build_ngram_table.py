@@ -39,6 +39,14 @@ def _process_chunk(args: tuple) -> dict:
 
 
 def main():
+    # Workers rely on the module-level `_shard` global being inherited via
+    # copy-on-write. That only works under "fork", which is no longer the
+    # default on Python 3.14 (forkserver) or macOS (spawn). Force it.
+    try:
+        mp.set_start_method("fork", force=True)
+    except (RuntimeError, ValueError):
+        pass
+
     ap = argparse.ArgumentParser(description="Build compressed n-gram table from a shard")
     ap.add_argument('--shard', required=True, help='One training shard (.bin) to scan')
     ap.add_argument('--output', required=True, help='Output compressed n-gram table')
