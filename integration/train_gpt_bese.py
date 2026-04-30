@@ -809,6 +809,65 @@ class Block(nn.Module):
             x_out = x_in + gate * (x_out - x_in)
         return x_out, raw_v
 
+
+def _apply_spatial_letter_init(
+    emb_weight: Tensor,
+    coord_path: str,
+    n_dims: int = 12,
+) -> int:
+    """v3: Initialize the first n_dims of letter-token rows from a fitted
+    spatial coords JSON file. Returns the number of rows updated.
+
+    Expected JSON format (produced by scripts/build_v3_space.py):
+      {
+        "coords_emb": {"a": [d1, d2, ..., dN], "b": [...], ...},
+        "letter_to_token_id": {"a": 4, "b": 5, ...}   # optional override
+      }
+
+    If the JSON is missing or empty, returns 0 and leaves the embedding
+    untouched (caller falls back to the random init already applied).
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    if not coord_path:
+        return 0
+    p = _Path(coord_path)
+    if not p.exists():
+        return 0
+    try:
+        with open(p, "r") as f:
+            blob = _json.load(f)
+    except Exception:
+        return 0
+    coords_emb = blob.get("coords_emb", {})
+    if not coords_emb:
+        return 0
+    # Default v3 letter-to-id map: a..z -> 4..29 (matches bese_v3_constants.py).
+    default_letters = "abcdefghijklmnopqrstuvwxyz"
+    default_letter_start = 4
+    letter_to_id = blob.get("letter_to_token_id", None)
+    if letter_to_id is None:
+        letter_to_id = {ch: default_letter_start + i for i, ch in enumerate(default_letters)}
+    updated = 0
+    vocab_size, model_dim = emb_weight.shape
+    eff_dims = min(n_dims, model_dim)
+    with torch.no_grad():
+        for letter, tid in letter_to_id.items():
+            if letter not in coords_emb:
+                continue
+            if not (0 <= tid < vocab_size):
+                continue
+            vec = coords_emb[letter]
+            k = min(eff_dims, len(vec))
+            if k <= 0:
+                continue
+            emb_weight[tid, :k] = torch.tensor(
+                vec[:k], dtype=emb_weight.dtype, device=emb_weight.device
+            )
+            updated += 1
+    return updated
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -932,6 +991,17 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+            # v3 (opt-in): overwrite first N dims of letter-token rows
+            # with fitted spatial coordinates. Other rows keep their random init.
+            if int(os.environ.get("SPATIAL_INIT_ENABLED", "0")):
+                _coord_path = os.environ.get("SPATIAL_INIT_PATH", "")
+                _n_dims = int(os.environ.get("SPATIAL_INIT_DIMS", "12"))
+                _updated = _apply_spatial_letter_init(self.tok_emb.weight, _coord_path, _n_dims)
+                if int(os.environ.get("RANK", "0")) == 0:
+                    if _updated > 0:
+                        print(f"[v3] spatial_init: updated {_updated} letter rows × first {_n_dims} dims from {_coord_path}", flush=True)
+                    else:
+                        print(f"[v3] spatial_init: enabled but no rows updated (path={_coord_path!r}) — keeping random init", flush=True)
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         # Init banks: orthogonal, with proj layers scaled down and out/down zero-init

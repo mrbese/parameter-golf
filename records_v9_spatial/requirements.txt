@@ -1,0 +1,5 @@
+numpy>=1.24.0,<3
+torch>=2.1.0
+einops
+sentencepiece
+flash-attn>=2.7.0
