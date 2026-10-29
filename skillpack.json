@@ -1,0 +1,19 @@
+{
+  "name": "gbrain-memory",
+  "author": "GBrain contributors",
+  "license": "MIT",
+  "version": "0.60.27.0",
+  "homepage": "https://github.com/garrytan/gbrain",
+  "provenance": {"sha256":{"LICENSE":"e56fbb5b3d95756f3fa1cfefa24732ec79f18ece1ad08a4e79e00df57e8b198c","skills/memory-care/SKILL.md":"4f05fcaf1ae8478b3efa837843a31a566ace1ef9acc72bd745db604bbec53ed3","skills/brain-router/SKILL.md":"e978dcb96587e4867b01d925878f0eca59cfab33cd0bf527e22b508a38566507","skills/memory-recall/SKILL.md":"e436228a6598d07a92f0324a86824b2618753eb8a6441c132c2a286242f694a3"},"source":"src/core/shared-skills/setup-bundle.ts","release":"0.60.27.0","upstream":"garrytan/gbrain"},
+  "api_version": "gbrain-skillpack-v1",
+  "description": "Keyless memory workflows and a compact shared-brain router.",
+  "shared_deps": [],
+  "brain_resident": true,
+  "gbrain_min_version": "0.60.27.0",
+  "skills": ["skills/brain-router","skills/memory-care","skills/memory-recall"],
+  "shared_skills": {"schema_version":2,"skills":[
+    {"name":"brain-router","revision":"d01af8ba-a7b4-4f48-898d-33dc690e50bc","files":[{"path":"skills/brain-router/SKILL.md","size":1972,"sha256":"e978dcb96587e4867b01d925878f0eca59cfab33cd0bf527e22b508a38566507","audience":["readers"],"depends_on":[],"file_class":"prose","media_type":"text/markdown"}]},
+    {"name":"memory-care","revision":"624f587e-d173-4d78-bc37-30e103547bdc","files":[{"path":"skills/memory-care/SKILL.md","size":2206,"sha256":"4f05fcaf1ae8478b3efa837843a31a566ace1ef9acc72bd745db604bbec53ed3","audience":["readers"],"depends_on":[],"file_class":"prose","media_type":"text/markdown"}]},
+    {"name":"memory-recall","revision":"7099d833-4a03-45ed-8802-6dfe21d077af","files":[{"path":"skills/memory-recall/SKILL.md","size":1647,"sha256":"e436228a6598d07a92f0324a86824b2618753eb8a6441c132c2a286242f694a3","audience":["readers"],"depends_on":[],"file_class":"prose","media_type":"text/markdown"}]}
+  ]}
+}

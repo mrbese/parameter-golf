@@ -1,0 +1,11 @@
+# gbrain ignore patterns for BESE / Parameter Golf
+.venv/
+**/.venv/
+.git/
+__pycache__/
+**/__pycache__/
+*.pt
+*.ckpt
+*.safetensors
+wandb/
+.DS_Store
